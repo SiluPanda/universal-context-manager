@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "context-mcp": {
+      "command": "./scripts/run-context-mcp.sh",
+      "env": {
+        "CONTEXT_MANAGER_HARNESS": "claude-code"
+      }
+    }
+  }
+}

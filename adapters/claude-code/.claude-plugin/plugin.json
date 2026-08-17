@@ -1,0 +1,19 @@
+{
+  "name": "context-manager",
+  "description": "Local-first durable context for Claude Code.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Universal Context Manager contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "context",
+    "mcp",
+    "hooks",
+    "claude-code",
+    "local-first"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

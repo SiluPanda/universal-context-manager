@@ -1,0 +1,9 @@
+# Example user config after installing the local Codex marketplace fixture.
+# This file is documentation only; merge the relevant parts into ~/.codex/config.toml.
+
+[plugins."context-manager"]
+enabled = true
+
+[plugins."context-manager".mcp_servers."context-mcp"]
+enabled = true
+default_tools_approval_mode = "prompt"

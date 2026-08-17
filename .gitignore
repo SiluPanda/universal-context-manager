@@ -1,0 +1,12 @@
+.DS_Store
+.env
+*.log
+/target/
+/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/target/
+/apps/desktop/src-tauri/gen/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+coverage/

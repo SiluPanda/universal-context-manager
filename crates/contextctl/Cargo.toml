@@ -1,0 +1,19 @@
+[package]
+name = "contextctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+context-client = { path = "../context-client" }
+context-core = { path = "../context-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

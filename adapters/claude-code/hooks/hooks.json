@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/run-context-hook.sh",
+              "claude-code",
+              "session-start"
+            ],
+            "statusMessage": "Loading Universal Context Manager context"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/run-context-hook.sh",
+              "claude-code",
+              "session-end"
+            ],
+            "statusMessage": "Flushing context state"
+          }
+        ]
+      }
+    ]
+  }
+}

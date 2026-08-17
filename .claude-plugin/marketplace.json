@@ -1,0 +1,20 @@
+{
+  "name": "universal-context-manager-local",
+  "owner": {
+    "name": "Universal Context Manager contributors"
+  },
+  "metadata": {
+    "description": "Local Claude Code marketplace fixture for Universal Context Manager."
+  },
+  "plugins": [
+    {
+      "name": "context-manager",
+      "source": "./adapters/claude-code",
+      "description": "Local-first durable context for Claude Code.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Universal Context Manager contributors"
+      }
+    }
+  ]
+}

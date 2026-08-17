@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/run-context-hook.sh\" codex session-start",
+            "statusMessage": "Loading Universal Context Manager context"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/run-context-hook.sh\" codex session-end",
+            "statusMessage": "Flushing context state"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "context-manager",
+  "version": "0.1.0",
+  "description": "Local-first durable context for Codex.",
+  "author": {
+    "name": "Universal Context Manager contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "context",
+    "mcp",
+    "hooks",
+    "codex",
+    "local-first"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Context Manager",
+    "shortDescription": "Layered local context for Codex sessions.",
+    "longDescription": "Local Codex plugin for Universal Context Manager. It injects composed session-start context, exposes MCP tools for compose/search/commit, and keeps hook cleanup fail-open.",
+    "developerName": "Universal Context Manager contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Load the latest project and task context before we continue.",
+      "Review the current handoff note and tell me what changed.",
+      "Prepare an export bundle I can inspect before sharing."
+    ]
+  }
+}
