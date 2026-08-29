@@ -4,7 +4,7 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-for command in cargo jq; do
+for command in cargo git jq; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "required command not found: $command" >&2
     exit 1
@@ -17,6 +17,7 @@ workdir="$(mktemp -d)"
 home="$workdir/home"
 project="$workdir/demo-project"
 mkdir -p "$home" "$project"
+git -C "$project" init --quiet
 daemon_pid=""
 
 cleanup() {
@@ -46,7 +47,39 @@ ctl() {
     "$root/target/debug/contextctl" "$@"
 }
 
-ctl ping --json | jq -e '.schema_version >= 1' >/dev/null
+ctl ping --json \
+  | jq -e '.schema_version >= 1 and .api_version == 1 and (.component_version | length > 0)' \
+  >/dev/null
+
+ctl doctor --json >"$workdir/doctor.json"
+jq -e '
+  any(.checks[]; .id == "daemon_reachable" and .status == "pass")
+  and any(.checks[]; .id == "mcp_handshake" and .status == "pass")
+  and any(.checks[]; .id == "review_policy" and .status == "pass")
+' "$workdir/doctor.json" >/dev/null
+
+printf '# Project instructions\n\nKeep setup checks deterministic.\n' >"$project/AGENTS.md"
+ctl setup --project "$project" --source "$project/AGENTS.md" --json >"$workdir/setup.json"
+jq -e '
+  .project_scope.kind == "project"
+  and .import_preview.candidates[0].detected_source_kind == "agents_md"
+  and .import_result == null
+' "$workdir/setup.json" >/dev/null
+
+ctl source-import apply "$project/AGENTS.md" \
+  --scope project \
+  --scope-id "$project" \
+  --json >"$workdir/source-import.json"
+jq -e '
+  .candidate_count == 1
+  and .applied_count == 1
+  and .rejected_count == 0
+' "$workdir/source-import.json" >/dev/null
+
+ctl policy set strict --actor smoke --json >"$workdir/policy-strict.json"
+jq -e '.mode == "strict"' "$workdir/policy-strict.json" >/dev/null
+ctl policy set balanced --actor smoke --json >"$workdir/policy-balanced.json"
+jq -e '.mode == "balanced"' "$workdir/policy-balanced.json" >/dev/null
 
 ctl entry put \
   --scope project \
@@ -62,7 +95,11 @@ ctl entry put \
 jq -e '.scope.kind == "project" and .key == "conventions"' "$workdir/put.json" >/dev/null
 
 ctl compose --project "$project" --json >"$workdir/compose.json"
-jq -e '.rendered_markdown | contains("deterministic request identifiers")' "$workdir/compose.json" >/dev/null
+jq -e '
+  (.rendered_markdown | contains("deterministic request identifiers"))
+  and (.rendered_markdown | contains("Keep setup checks deterministic"))
+  and .metrics.included_entries == 2
+' "$workdir/compose.json" >/dev/null
 
 cat >"$workdir/global-commit.json" <<'JSON'
 {

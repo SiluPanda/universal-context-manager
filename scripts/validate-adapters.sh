@@ -8,9 +8,16 @@ strict_external="${STRICT_EXTERNAL_VALIDATORS:-0}"
 
 cd "$root"
 
+sh -n \
+  scripts/install-local.sh \
+  scripts/test-install-local.sh \
+  adapters/shared/scripts/run-context-hook.sh \
+  adapters/shared/scripts/run-context-mcp.sh
+./scripts/install-local.sh --help >/dev/null
 ./scripts/sync-shared-assets.sh --check
 ./scripts/test-hooks.sh
 ./scripts/e2e-smoke.sh
+./scripts/test-install-local.sh
 
 warn_or_fail() {
   message="$1"

@@ -14,6 +14,11 @@ Please open a private GitHub security advisory rather than a public issue. Do no
   Unix platforms.
 - The MCP adapter intentionally fails open so a context failure does not block the host harness.
 - Credential-shaped content is rejected from automated memory writes.
+- Desktop project, import, and export paths are authorized through canonical, one-time,
+  operation-bound native-dialog grants.
 - No remote listener, cloud sync, analytics, or model API is enabled in the validation MVP.
 
 The database remains readable to software running as the same macOS user. Use FileVault and normal macOS account isolation; this release does not implement application-level database encryption.
+
+Adapters may include composed context in requests sent by their host harness to that harness's
+configured model provider. Local UCM persistence does not make third-party model inference local.

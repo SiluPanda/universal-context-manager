@@ -14,11 +14,21 @@ The Codex adapter is packaged as the local plugin fixture at `plugins/context-ma
 From the repository root:
 
 ```bash
+./scripts/install-local.sh --codex
+```
+
+For a manual plugin-only install:
+
+```bash
 codex plugin marketplace add .
 codex plugin add context-manager@universal-context-manager-local
 ```
 
-Optional user config is documented in [`config.example.toml`](config.example.toml).
+The plugin still needs resolvable `contextctl` and `context-mcp` binaries. The source installer
+places them in `~/.local/bin`, which the shared launchers check directly. Optional user config is
+documented in [`config.example.toml`](config.example.toml).
+
+Verify the complete path with `contextctl doctor`.
 
 ## Runtime behavior
 

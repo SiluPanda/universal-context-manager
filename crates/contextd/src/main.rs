@@ -14,9 +14,10 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 const MAX_IPC_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const COMPONENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
-#[command(name = "contextd", about = "Universal Context Manager daemon")]
+#[command(name = "contextd", version, about = "Universal Context Manager daemon")]
 struct Args {
     #[arg(long, env = "CONTEXT_DB_PATH")]
     db: Option<PathBuf>,
@@ -205,8 +206,12 @@ fn read_bounded_line<R: BufRead>(
 fn dispatch_request(request: IpcRequest, store: &ContextStore) -> IpcResponse {
     let id = request.id.clone();
     let result = match request.method.as_str() {
-        "ping" => serialize_core(store.health()),
+        "ping" => serialize_core(store.health_with_component_version(COMPONENT_VERSION)),
         "stats" => serialize_core(store.stats()),
+        "get_review_policy" => serialize_core(store.get_review_policy()),
+        "set_review_policy" => {
+            dispatch_owned(store, request.params, ContextStore::set_review_policy)
+        }
         "compose_context" => dispatch_owned(store, request.params, ContextStore::compose_context),
         "search_context" => dispatch_owned(store, request.params, ContextStore::search_context),
         "create_pack" => dispatch_owned(store, request.params, ContextStore::create_pack),
@@ -222,10 +227,19 @@ fn dispatch_request(request: IpcRequest, store: &ContextStore) -> IpcResponse {
         "review_approve" => dispatch_owned(store, request.params, ContextStore::review_approve),
         "review_reject" => dispatch_owned(store, request.params, ContextStore::review_reject),
         "review_edit" => dispatch_owned(store, request.params, ContextStore::review_edit),
+        "review_edit_and_approve" => {
+            dispatch_owned(store, request.params, ContextStore::review_edit_and_approve)
+        }
         "export_bundle" => dispatch_owned(store, request.params, ContextStore::export_bundle),
         "export_json" => dispatch_owned(store, request.params, ContextStore::export_json),
         "export_markdown" => dispatch_owned(store, request.params, ContextStore::export_markdown),
         "import_data" => dispatch_owned(store, request.params, ContextStore::import_data),
+        "preview_source_import" => {
+            dispatch_owned(store, request.params, ContextStore::preview_source_import)
+        }
+        "apply_source_import" => {
+            dispatch_owned(store, request.params, ContextStore::apply_source_import)
+        }
         "create_run" => dispatch_owned(store, request.params, ContextStore::create_run),
         "list_runs" => serialize_core(store.list_runs()),
         other => Err(format!("unknown method: {other}")),
@@ -286,7 +300,9 @@ mod tests {
     use super::*;
     use context_core::{
         CommitDisposition, CommitProposal, CommitStatus, CommitWorkRequest, ComposeRequest,
-        EntryInput, EntryValue, ScopeKind, ScopeRef,
+        EntryInput, EntryValue, ReviewEditAndApproveRequest, ReviewMode, ScopeKind, ScopeRef,
+        SetReviewPolicyRequest, SourceImportApplyRequest, SourceImportDocument, SourceImportKind,
+        SourceImportPreviewRequest,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -350,6 +366,80 @@ mod tests {
         let composed: context_core::ComposeResponse =
             serde_json::from_value(compose_response.result.expect("result")).expect("deserialize");
         assert!(composed.rendered_markdown.contains("hello daemon"));
+    }
+
+    #[test]
+    fn version_flag_is_available() {
+        let error = Args::try_parse_from(["contextd", "--version"]).expect_err("version exits");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(COMPONENT_VERSION));
+    }
+
+    #[test]
+    fn ping_reports_the_running_component_version() {
+        let store = ContextStore::open_in_memory().expect("store");
+        let response = dispatch_request(
+            IpcRequest {
+                id: "ping".to_string(),
+                method: "ping".to_string(),
+                params: json!({}),
+            },
+            &store,
+        );
+        assert!(response.ok);
+
+        let health: context_core::HealthReport =
+            serde_json::from_value(response.result.expect("result")).expect("health");
+        assert_eq!(health.component_version.as_deref(), Some(COMPONENT_VERSION));
+        assert_eq!(health.api_version, Some(context_core::CONTEXT_API_VERSION));
+    }
+
+    #[test]
+    fn dispatches_atomic_review_edit_and_approve() {
+        let store = ContextStore::open_in_memory().expect("store");
+        let pending = dispatch_request(
+            IpcRequest {
+                id: "commit".to_string(),
+                method: "commit_work".to_string(),
+                params: serde_json::to_value(sample_commit(ScopeRef::global())).expect("request"),
+            },
+            &store,
+        );
+        assert!(pending.ok);
+        let pending: context_core::CommitWorkResult =
+            serde_json::from_value(pending.result.expect("result")).expect("commit result");
+        let review_id = pending.items[0].review_id.clone().expect("review id");
+
+        let response = dispatch_request(
+            IpcRequest {
+                id: "atomic-review".to_string(),
+                method: "review_edit_and_approve".to_string(),
+                params: serde_json::to_value(ReviewEditAndApproveRequest {
+                    review_id,
+                    title: Some("Approved over IPC".to_string()),
+                    kind: None,
+                    value: Some(EntryValue::Markdown {
+                        body: "approved daemon body".to_string(),
+                    }),
+                    tags: None,
+                    metadata: None,
+                    locked: None,
+                    actor: "reviewer".to_string(),
+                    note: Some("atomic".to_string()),
+                })
+                .expect("request"),
+            },
+            &store,
+        );
+        assert!(response.ok);
+        let approved: context_core::ReviewItem =
+            serde_json::from_value(response.result.expect("result")).expect("approved review");
+        assert_eq!(approved.state, context_core::ReviewState::Approved);
+        assert_eq!(
+            approved.proposed_entry.title.as_deref(),
+            Some("Approved over IPC")
+        );
+        assert_eq!(approved.resolution_note.as_deref(), Some("atomic"));
     }
 
     #[test]
@@ -419,6 +509,89 @@ mod tests {
         let items: Vec<context_core::ReviewItem> =
             serde_json::from_value(reviews.result.expect("result")).expect("reviews");
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn dispatches_review_policy_and_staged_source_import() {
+        let store = ContextStore::open_in_memory().expect("store");
+        let set_policy = dispatch_request(
+            IpcRequest {
+                id: "policy-set".to_string(),
+                method: "set_review_policy".to_string(),
+                params: serde_json::to_value(SetReviewPolicyRequest {
+                    mode: ReviewMode::Fast,
+                    metadata: json!({"ui": "desktop"}),
+                    actor: "tester".to_string(),
+                })
+                .expect("params"),
+            },
+            &store,
+        );
+        assert!(set_policy.ok);
+        let policy: context_core::ReviewPolicy =
+            serde_json::from_value(set_policy.result.expect("policy")).expect("deserialize");
+        assert_eq!(policy.mode, ReviewMode::Fast);
+
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let document = SourceImportDocument {
+            path: Some("AGENTS.md".to_string()),
+            payload: "# Agent instructions\n\nBe precise.".to_string(),
+        };
+        let preview = dispatch_request(
+            IpcRequest {
+                id: "import-preview".to_string(),
+                method: "preview_source_import".to_string(),
+                params: serde_json::to_value(SourceImportPreviewRequest {
+                    source_kind: SourceImportKind::Auto,
+                    documents: vec![document.clone()],
+                    destination: destination.clone(),
+                    pack_name: None,
+                    actor: "tester".to_string(),
+                })
+                .expect("params"),
+            },
+            &store,
+        );
+        assert!(preview.ok);
+        let preview: context_core::SourceImportPreview =
+            serde_json::from_value(preview.result.expect("preview")).expect("deserialize");
+        assert_eq!(
+            preview.candidates[0].detected_source_kind,
+            SourceImportKind::AgentsMd
+        );
+        assert!(!preview.destination_pack.exists);
+        assert!(preview.preview_fingerprint.is_some());
+
+        let applied = dispatch_request(
+            IpcRequest {
+                id: "import-apply".to_string(),
+                method: "apply_source_import".to_string(),
+                params: serde_json::to_value(SourceImportApplyRequest {
+                    source_kind: SourceImportKind::Auto,
+                    documents: vec![document],
+                    destination,
+                    pack_name: None,
+                    actor: "tester".to_string(),
+                    expected_preview_fingerprint: preview.preview_fingerprint,
+                })
+                .expect("params"),
+            },
+            &store,
+        );
+        assert!(applied.ok);
+        let applied: context_core::SourceImportApplyResult =
+            serde_json::from_value(applied.result.expect("apply")).expect("deserialize");
+        assert_eq!(applied.applied_count, 1);
+
+        let get_policy = dispatch_request(
+            IpcRequest {
+                id: "policy-get".to_string(),
+                method: "get_review_policy".to_string(),
+                params: json!({}),
+            },
+            &store,
+        );
+        assert!(get_policy.ok);
     }
 
     #[test]

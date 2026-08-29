@@ -183,6 +183,12 @@ pub fn import_markdown(markdown: &str) -> ContextResult<ContextExportBundle> {
         });
     }
 
+    if entries.is_empty() {
+        return Err(ContextError::validation(
+            "markdown import contains no UCM_ENTRY markers",
+        ));
+    }
+
     Ok(ContextExportBundle {
         exported_at: crate::model::now_utc(),
         packs,
@@ -223,5 +229,17 @@ pub fn entry_input_from_record(record: &crate::model::EntryRecord) -> EntryInput
         metadata: record.metadata.clone(),
         locked: record.locked,
         provenance: Some(record.provenance.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_markdown_without_ucm_entries() {
+        let err = import_markdown("# Ordinary Markdown\n\nNo export markers.")
+            .expect_err("ordinary markdown must not import as an empty bundle");
+        assert!(matches!(err, ContextError::Validation(message) if message.contains("UCM_ENTRY")));
     }
 }

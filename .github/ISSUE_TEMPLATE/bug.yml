@@ -16,7 +16,7 @@ body:
     id: component
     attributes:
       label: Component
-      options: [Core daemon, MCP adapter, Codex adapter, Claude Code adapter, Desktop app, Import/export]
+      options: [Core daemon, CLI/setup/doctor, MCP adapter, Codex adapter, Claude Code adapter, Desktop app, Import/export]
     validations:
       required: true
   - type: textarea
@@ -31,3 +31,8 @@ body:
       label: Expected behavior
     validations:
       required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Run `contextctl --json doctor`, inspect it, and paste only non-sensitive checks. Never attach the database, exports, prompts, or context bodies.

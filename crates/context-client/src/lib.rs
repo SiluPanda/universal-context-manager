@@ -3,8 +3,10 @@ use context_core::{
     CommitWorkRequest, CommitWorkResult, ComposeRequest, ComposeResponse, ContextExportBundle,
     ContextPaths, CreatePackRequest, DeleteEntryRequest, EntryRecord, EntrySelector, ExportRequest,
     HealthReport, ImportRequest, IpcRequest, IpcResponse, PackRecord, PutEntryRequest,
-    RevertEntryRequest, ReviewDecisionRequest, ReviewEditRequest, ReviewItem, ReviewState,
-    RunInput, RunRecord, SearchRequest, SearchResponse, StoreStats, UpdatePackRequest,
+    RevertEntryRequest, ReviewDecisionRequest, ReviewEditAndApproveRequest, ReviewEditRequest,
+    ReviewItem, ReviewPolicy, ReviewState, RunInput, RunRecord, SearchRequest, SearchResponse,
+    SetReviewPolicyRequest, SourceImportApplyRequest, SourceImportApplyResult, SourceImportPreview,
+    SourceImportPreviewRequest, StoreStats, UpdatePackRequest,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -112,6 +114,14 @@ impl ContextClient {
         self.call("stats", &json!({}))
     }
 
+    pub fn get_review_policy(&self) -> ClientResult<ReviewPolicy> {
+        self.call("get_review_policy", &json!({}))
+    }
+
+    pub fn set_review_policy(&self, request: SetReviewPolicyRequest) -> ClientResult<ReviewPolicy> {
+        self.call("set_review_policy", &request)
+    }
+
     pub fn compose_context(&self, request: ComposeRequest) -> ClientResult<ComposeResponse> {
         self.call("compose_context", &request)
     }
@@ -188,6 +198,13 @@ impl ContextClient {
         self.call("review_edit", &request)
     }
 
+    pub fn review_edit_and_approve(
+        &self,
+        request: ReviewEditAndApproveRequest,
+    ) -> ClientResult<ReviewItem> {
+        self.call("review_edit_and_approve", &request)
+    }
+
     pub fn export_bundle(&self, request: ExportRequest) -> ClientResult<ContextExportBundle> {
         self.call("export_bundle", &request)
     }
@@ -202,6 +219,20 @@ impl ContextClient {
 
     pub fn import_data(&self, request: ImportRequest) -> ClientResult<ContextExportBundle> {
         self.call("import_data", &request)
+    }
+
+    pub fn preview_source_import(
+        &self,
+        request: SourceImportPreviewRequest,
+    ) -> ClientResult<SourceImportPreview> {
+        self.call("preview_source_import", &request)
+    }
+
+    pub fn apply_source_import(
+        &self,
+        request: SourceImportApplyRequest,
+    ) -> ClientResult<SourceImportApplyResult> {
+        self.call("apply_source_import", &request)
     }
 
     pub fn create_run(&self, request: RunInput) -> ClientResult<RunRecord> {
@@ -705,6 +736,9 @@ mod tests {
                 generated_at: chrono::Utc::now(),
                 sections: vec![],
                 rendered_markdown: "ok".to_string(),
+                metrics: context_core::ComposeMetrics::default(),
+                exclusions: vec![],
+                warnings: vec![],
             };
             IpcResponse::success(request.id, serde_json::to_value(response).expect("value"))
         });
@@ -717,6 +751,200 @@ mod tests {
             .expect("compose");
         join.join().expect("joined");
         assert_eq!(response.rendered_markdown, "ok");
+    }
+
+    #[test]
+    fn sends_atomic_review_edit_and_approve_request() {
+        let paths = temp_paths();
+        let client = ContextClient::new(ClientConfig {
+            paths: paths.clone(),
+            autostart: false,
+            contextd_bin: None,
+            connect_timeout: Duration::from_secs(1),
+            start_timeout: Duration::from_secs(1),
+        });
+        let join = spawn_mock_server(paths.socket_path.clone(), |request| {
+            assert_eq!(request.method, "review_edit_and_approve");
+            let parsed: context_core::ReviewEditAndApproveRequest =
+                serde_json::from_value(request.params).expect("atomic review request");
+            assert_eq!(parsed.actor, "reviewer");
+            assert_eq!(parsed.note.as_deref(), Some("ship it"));
+            let now = chrono::Utc::now();
+            let review = context_core::ReviewItem {
+                id: parsed.review_id,
+                request_id: "req-review".to_string(),
+                scope: ScopeRef::global(),
+                pack_name: "main".to_string(),
+                entry_key: "key".to_string(),
+                state: context_core::ReviewState::Approved,
+                reason: context_core::ReviewReason::GlobalScope,
+                proposed_entry: context_core::EntryInput {
+                    key: "key".to_string(),
+                    title: parsed.title,
+                    kind: parsed.kind.unwrap_or_else(|| "note".to_string()),
+                    value: parsed.value.unwrap_or(context_core::EntryValue::Markdown {
+                        body: "body".to_string(),
+                    }),
+                    tags: parsed.tags.unwrap_or_default(),
+                    metadata: parsed.metadata.unwrap_or_else(|| json!({})),
+                    locked: parsed.locked.unwrap_or(false),
+                    provenance: None,
+                },
+                existing_entry: None,
+                resolution_note: parsed.note,
+                created_at: now,
+                updated_at: now,
+                revision_no: 2,
+            };
+            IpcResponse::success(
+                request.id,
+                serde_json::to_value(review).expect("review response"),
+            )
+        });
+
+        let approved = client
+            .review_edit_and_approve(context_core::ReviewEditAndApproveRequest {
+                review_id: "review-1".to_string(),
+                title: Some("Approved".to_string()),
+                kind: None,
+                value: None,
+                tags: None,
+                metadata: None,
+                locked: Some(true),
+                actor: "reviewer".to_string(),
+                note: Some("ship it".to_string()),
+            })
+            .expect("atomic review");
+        join.join().expect("server joined");
+        assert_eq!(approved.state, context_core::ReviewState::Approved);
+        assert_eq!(approved.proposed_entry.title.as_deref(), Some("Approved"));
+        assert!(approved.proposed_entry.locked);
+        assert_eq!(approved.resolution_note.as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn sends_typed_policy_and_source_import_requests() {
+        let paths = temp_paths();
+        let client = ContextClient::new(ClientConfig {
+            paths: paths.clone(),
+            autostart: false,
+            contextd_bin: None,
+            connect_timeout: Duration::from_secs(1),
+            start_timeout: Duration::from_secs(1),
+        });
+
+        let policy_join = spawn_mock_server(paths.socket_path.clone(), |request| {
+            assert_eq!(request.method, "set_review_policy");
+            let parsed: context_core::SetReviewPolicyRequest =
+                serde_json::from_value(request.params).expect("policy request");
+            assert_eq!(parsed.mode, context_core::ReviewMode::Strict);
+            IpcResponse::success(
+                request.id,
+                serde_json::to_value(context_core::ReviewPolicy {
+                    mode: parsed.mode,
+                    metadata: parsed.metadata,
+                    updated_at: chrono::Utc::now(),
+                    updated_by: parsed.actor,
+                    revision_no: 2,
+                })
+                .expect("policy response"),
+            )
+        });
+        let policy = client
+            .set_review_policy(context_core::SetReviewPolicyRequest {
+                mode: context_core::ReviewMode::Strict,
+                metadata: json!({"source": "test"}),
+                actor: "tester".to_string(),
+            })
+            .expect("set policy");
+        policy_join.join().expect("policy server");
+        assert_eq!(policy.mode, context_core::ReviewMode::Strict);
+
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("destination");
+        let document = context_core::SourceImportDocument {
+            path: Some("AGENTS.md".to_string()),
+            payload: "# Instructions".to_string(),
+        };
+        let preview_join = spawn_mock_server(paths.socket_path.clone(), |request| {
+            assert_eq!(request.method, "preview_source_import");
+            let parsed: context_core::SourceImportPreviewRequest =
+                serde_json::from_value(request.params).expect("preview request");
+            IpcResponse::success(
+                request.id,
+                serde_json::to_value(context_core::SourceImportPreview {
+                    destination: parsed.destination,
+                    pack_name: parsed.pack_name.unwrap_or_else(|| "main".to_string()),
+                    review_mode: context_core::ReviewMode::Strict,
+                    destination_pack: context_core::SourceImportPackGovernance {
+                        exists: true,
+                        status: Some(context_core::PackStatus::Active),
+                        locked: true,
+                        lock_reason: Some("hold".to_string()),
+                        revision_no: Some(3),
+                    },
+                    preview_fingerprint: Some("preview-test".to_string()),
+                    candidates: vec![],
+                    warnings: vec![],
+                    apply_allowed: true,
+                })
+                .expect("preview response"),
+            )
+        });
+        let preview = client
+            .preview_source_import(context_core::SourceImportPreviewRequest {
+                source_kind: context_core::SourceImportKind::Auto,
+                documents: vec![document.clone()],
+                destination: destination.clone(),
+                pack_name: None,
+                actor: "tester".to_string(),
+            })
+            .expect("preview");
+        preview_join.join().expect("preview server");
+        assert_eq!(preview.destination, destination);
+        assert_eq!(preview.preview_fingerprint.as_deref(), Some("preview-test"));
+        assert!(preview.destination_pack.exists);
+        assert!(preview.destination_pack.locked);
+        assert_eq!(preview.destination_pack.revision_no, Some(3));
+
+        let apply_join = spawn_mock_server(paths.socket_path.clone(), |request| {
+            assert_eq!(request.method, "apply_source_import");
+            let parsed: context_core::SourceImportApplyRequest =
+                serde_json::from_value(request.params).expect("apply request");
+            assert_eq!(parsed.documents.len(), 1);
+            assert_eq!(
+                parsed.expected_preview_fingerprint.as_deref(),
+                Some("preview-test")
+            );
+            IpcResponse::success(
+                request.id,
+                serde_json::to_value(context_core::SourceImportApplyResult {
+                    request_id: "source-import-test".to_string(),
+                    candidate_count: 1,
+                    imported_count: 1,
+                    applied_count: 1,
+                    pending_count: 0,
+                    skipped_count: 0,
+                    rejected_count: 0,
+                    items: vec![],
+                    affected_entry_ids: vec!["entry-1".to_string()],
+                    affected_review_ids: vec![],
+                    affected_entry_keys: vec!["agents-instructions".to_string()],
+                })
+                .expect("apply response"),
+            )
+        });
+        let applied = client
+            .apply_source_import(context_core::SourceImportApplyRequest {
+                source_kind: context_core::SourceImportKind::Auto,
+                documents: vec![document],
+                destination,
+                pack_name: None,
+                actor: "tester".to_string(),
+                expected_preview_fingerprint: preview.preview_fingerprint,
+            })
+            .expect("apply");
+        apply_join.join().expect("apply server");
+        assert_eq!(applied.applied_count, 1);
     }
 
     #[test]

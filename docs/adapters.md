@@ -14,8 +14,14 @@ Both adapters:
 - inject context at `SessionStart`
 - keep `SessionEnd` cleanup fail-open
 - rely on `context-mcp` for `compose_context`, `search_context`, and `commit_work`
+- resolve source-installed binaries through `CONTEXT_MANAGER_BIN_DIR`, `PATH`, or
+  `~/.local/bin`, with explicit per-binary overrides still taking precedence
+- report persistence outcome counts instead of claiming a write succeeded without confirmation
 
 See the adapter-specific READMEs under `adapters/codex/` and `adapters/claude-code/` for install commands.
+
+Use `contextctl doctor` for end-to-end health. The existence of a harness configuration directory
+alone is not sufficient to mark an adapter healthy.
 
 ## Any other coding or non-coding harness
 

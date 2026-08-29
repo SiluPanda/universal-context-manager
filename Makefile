@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test test-rust test-desktop test-e2e build build-rust build-desktop bundle-desktop prepare-sidecars validate-plugins clean
+.PHONY: check fmt lint test test-rust test-desktop test-e2e build build-rust build-desktop bundle-desktop prepare-sidecars install-local validate-plugins clean
 
 check: fmt lint test build
 
@@ -30,6 +30,9 @@ build-desktop:
 
 prepare-sidecars:
 	./scripts/prepare-sidecars.sh release
+
+install-local:
+	./scripts/install-local.sh
 
 bundle-desktop:
 	cd apps/desktop && pnpm tauri build

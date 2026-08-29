@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const UNIX_SOCKET_PATH_LIMIT: usize = 96;
 
@@ -47,6 +48,40 @@ impl ContextPaths {
         ensure_dir(&absolute_path(&self.spool_dir)?)?;
         Ok(())
     }
+}
+
+pub fn normalize_project_scope_id(project_scope_id: &str) -> ContextResult<String> {
+    let trimmed = project_scope_id.trim();
+    if trimmed.is_empty() {
+        return Err(ContextError::validation("project scope id is required"));
+    }
+    let candidate = PathBuf::from(trimmed);
+    if !candidate.is_dir() {
+        return Ok(trimmed.to_string());
+    }
+
+    let canonical = candidate.canonicalize()?;
+    let normalized = discover_git_root(&canonical).unwrap_or(canonical);
+    Ok(normalized.display().to_string())
+}
+
+fn discover_git_root(directory: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(root);
+    Some(root.canonicalize().unwrap_or(root))
 }
 
 fn env_path(key: &str) -> ContextResult<Option<PathBuf>> {
@@ -258,6 +293,67 @@ mod tests {
             assert_eq!(data_mode, 0o700);
             assert_eq!(spool_mode, 0o700);
         }
+    }
+
+    #[test]
+    fn logical_project_scope_ids_are_preserved() {
+        assert_eq!(
+            normalize_project_scope_id("logical-project-id").expect("scope"),
+            "logical-project-id"
+        );
+        assert_eq!(
+            normalize_project_scope_id("  logical-project-id  ").expect("trimmed scope"),
+            "logical-project-id"
+        );
+        assert!(normalize_project_scope_id("   ").is_err());
+    }
+
+    #[test]
+    fn existing_project_directory_falls_back_to_canonical_path() {
+        let dir = tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("project");
+
+        assert_eq!(
+            PathBuf::from(
+                normalize_project_scope_id(project.to_str().expect("utf-8 path")).expect("scope")
+            ),
+            project.canonicalize().expect("canonical project")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_symlink_and_nested_directory_resolve_to_canonical_git_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("repository");
+        let nested = root.join("nested/project");
+        fs::create_dir_all(&nested).expect("nested");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let alias = dir.path().join("repository-alias");
+        symlink(&nested, &alias).expect("symlink");
+
+        let canonical_root = root.canonicalize().expect("canonical root");
+        assert_eq!(
+            PathBuf::from(
+                normalize_project_scope_id(alias.to_str().expect("utf-8 alias")).expect("alias")
+            ),
+            canonical_root
+        );
+        assert_eq!(
+            PathBuf::from(
+                normalize_project_scope_id(nested.to_str().expect("utf-8 nested")).expect("nested")
+            ),
+            canonical_root
+        );
     }
 
     #[test]

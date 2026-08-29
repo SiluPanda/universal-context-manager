@@ -92,6 +92,24 @@ grep -q 'codex|session-start|' "$log_file"
 grep -q 'claude-code|session-end|' "$log_file"
 grep -q "$sample_payload" "$log_file"
 
+managed_bin="$workdir/managed-bin"
+mkdir -p "$managed_bin"
+cp "$workdir/contextctl" "$managed_bin/contextctl"
+CONTEXT_TEST_LOG="$log_file" CONTEXT_MANAGER_BIN_DIR="$managed_bin" CONTEXTCTL_BIN= \
+  sh plugins/context-manager/scripts/run-context-hook.sh codex session-start <<EOF_PAYLOAD
+$sample_payload
+EOF_PAYLOAD
+grep -q 'codex|session-start|' "$log_file"
+
+user_bin="$workdir/home/.local/bin"
+mkdir -p "$user_bin"
+cp "$workdir/contextctl" "$user_bin/contextctl"
+CONTEXT_TEST_LOG="$log_file" HOME="$workdir/home" CONTEXTCTL_BIN= CONTEXT_MANAGER_BIN_DIR= \
+  PATH="/usr/bin:/bin" sh plugins/context-manager/scripts/run-context-hook.sh codex session-start <<EOF_PAYLOAD
+$sample_payload
+EOF_PAYLOAD
+grep -q 'codex|session-start|' "$log_file"
+
 cat > "$workdir/contextctl-unsupported" <<'STUB'
 #!/bin/sh
 set -eu
@@ -124,6 +142,17 @@ STUB
 chmod +x "$workdir/context-mcp"
 CONTEXT_TEST_LOG="$log_file" CONTEXT_MCP_BIN="$workdir/context-mcp" CONTEXT_MANAGER_HARNESS="codex" sh plugins/context-manager/scripts/run-context-mcp.sh
 
+grep -q 'serve --adapter codex --stdio' "$log_file"
+
+cp "$workdir/context-mcp" "$managed_bin/context-mcp"
+CONTEXT_TEST_LOG="$log_file" CONTEXT_MANAGER_BIN_DIR="$managed_bin" CONTEXT_MCP_BIN= \
+  CONTEXT_MANAGER_HARNESS="codex" sh plugins/context-manager/scripts/run-context-mcp.sh
+grep -q 'serve --adapter codex --stdio' "$log_file"
+
+cp "$workdir/context-mcp" "$user_bin/context-mcp"
+CONTEXT_TEST_LOG="$log_file" HOME="$workdir/home" CONTEXT_MCP_BIN= CONTEXT_MANAGER_BIN_DIR= \
+  CONTEXT_MANAGER_HARNESS="codex" PATH="/usr/bin:/bin" \
+  sh plugins/context-manager/scripts/run-context-mcp.sh
 grep -q 'serve --adapter codex --stdio' "$log_file"
 
 cat > "$workdir/context-mcp-unsupported" <<'STUB'

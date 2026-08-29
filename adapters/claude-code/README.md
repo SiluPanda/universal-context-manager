@@ -14,11 +14,20 @@ The Claude Code adapter lives in `adapters/claude-code` and is published through
 From the repository root:
 
 ```bash
+./scripts/install-local.sh --claude-code
+```
+
+For a manual plugin-only install:
+
+```bash
 claude plugin marketplace add .
 claude plugin install context-manager@universal-context-manager-local
 ```
 
-After updates, reload plugins or start a new Claude Code session.
+The plugin still needs resolvable `contextctl` and `context-mcp` binaries. The source installer
+places them in `~/.local/bin`, which the shared launchers check directly.
+
+After updates, reload plugins or start a new Claude Code session, then run `contextctl doctor`.
 
 ## Runtime behavior
 

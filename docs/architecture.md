@@ -15,6 +15,23 @@ Universal Context Manager is a local-first, human-governed control plane for dur
 - SQLite is the source of truth for packs, entries, reviews, revisions, runs, and imports/exports.
 - `contextd` serves the same store over a Unix domain socket for harness-facing clients.
 - the desktop app reads and writes the same local store, while keeping separate local-only UI preferences.
+- the persisted review policy is shared by CLI, desktop, MCP, imports, and adapter writes
+
+## User-facing model
+
+- **Library:** approved entries grouped into internal packs.
+- **Inbox:** pending proposals and import conflicts.
+- **Effective context:** the ordered Global → Project → Task composition for a selected adapter.
+- **History:** immutable revision and provenance records.
+- **Connections:** verified daemon, MCP, and adapter health.
+
+Review policy modes are:
+
+- `strict`: review every non-duplicate proposal
+- `balanced`: review global, conflicting, and locked writes
+- `fast`: review global and locked writes while allowing project/task conflicts to apply
+
+Secret rejection remains mandatory in every mode.
 
 ## Adapter flow
 

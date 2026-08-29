@@ -9,6 +9,22 @@ permissions:
   contents: read
 
 jobs:
+  core-msrv:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --exclude app --all-targets --all-features
+
+  desktop-msrv:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p app --all-targets
+
   rust:
     runs-on: macos-14
     steps:

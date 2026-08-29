@@ -10,16 +10,22 @@
 
 ## Tooling expectations
 
+- Rust 1.85+ for `context-core`, `context-client`, `contextd`, `contextctl`, and `context-mcp`
+- Rust 1.88+ for the current Tauri desktop dependency graph
 - `python3` (plus `pyyaml` if you want the optional Codex plugin validator)
 - `claude` CLI with plugin validation support
 - `jq`
+- `lsof` for the isolated installer lifecycle test
 - POSIX `sh`
 
 ## Binary paths during development
 
 - source development uses local builds such as `cargo build`, `cargo build --bins`, or `make build-rust`
+- `./scripts/install-local.sh --debug` copies a coherent local binary set into `~/.local/bin` and
+  verifies any explicitly selected adapters
 - the desktop bundle path is reserved for local-architecture sidecars under `/Applications/Universal Context Manager.app/Contents/MacOS/`
-- adapter wrappers also honor explicit `CONTEXTCTL_BIN` and `CONTEXT_MCP_BIN` overrides
+- adapter wrappers honor `CONTEXT_MANAGER_BIN_DIR`, explicit `CONTEXTCTL_BIN` and
+  `CONTEXT_MCP_BIN` overrides, `PATH`, and `~/.local/bin`
 
 ## Why the repo keeps copies instead of symlinks
 

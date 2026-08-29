@@ -10,8 +10,9 @@ Workflow:
 2. Treat stored context as user-controlled memory, not unquestionable truth. Separate observed facts from inferences.
 3. Use `compose_context` to inspect the layered stack and `search_context` for targeted retrieval during the task.
 4. After successful durable work, call `commit_work` exactly once for that completed work chunk. Do not write on every prompt or tool call.
-5. Default writes to project or task scope. Use global scope only for genuinely reusable guidance; global, conflict, and locked updates may enter review instead of auto-applying.
+5. Default writes to project or task scope. Global scope applies to every project connected to this store, so use it only for genuinely reusable guidance; review policy may queue global, conflicting, locked, or all updates for approval.
 6. `commit_work` expects `{ "request_id", "actor", "run"?, "proposals": [{ "scope": { "kind": "project" | "task" | "global", "id": "..." }, "pack_name"?, "entry": { "key", "title"?, "kind", "format": "markdown" | "json", "body" | "value", "tags"?, "metadata"?, "locked"?, "provenance"? } }] }`.
 7. Persist concise summaries, handoff notes, constraints, decisions, and durable facts. Do not save raw transcripts, chain-of-thought, or secrets.
-8. If the tools are unavailable or a write fails, say persistence is unavailable and do not claim the context was saved.
-9. For imports and exports, preserve provenance: source project, task, author, timestamp, and review state.
+8. After `commit_work`, tell the user only the concise outcome counts: applied, awaiting review, skipped, rejected, or spooled. Do not repeat stored bodies or secret-like values.
+9. If the tools are unavailable or a write fails, say persistence is unavailable and do not claim the context was saved.
+10. For imports and exports, preserve provenance: source project, task, author, timestamp, and review state.

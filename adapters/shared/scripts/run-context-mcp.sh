@@ -8,8 +8,20 @@ if [ -n "$context_mcp_bin" ] && [ ! -x "$context_mcp_bin" ]; then
   echo "[context-manager] CONTEXT_MCP_BIN is not executable: $context_mcp_bin" >&2
   exit 78
 fi
+if [ -z "$context_mcp_bin" ] && [ -n "${CONTEXT_MANAGER_BIN_DIR:-}" ]; then
+  candidate="${CONTEXT_MANAGER_BIN_DIR}/context-mcp"
+  if [ -x "$candidate" ]; then
+    context_mcp_bin="$candidate"
+  fi
+fi
 if [ -z "$context_mcp_bin" ]; then
   context_mcp_bin="$(command -v context-mcp 2>/dev/null || true)"
+fi
+if [ -z "$context_mcp_bin" ] && [ -n "${HOME:-}" ]; then
+  candidate="${HOME}/.local/bin/context-mcp"
+  if [ -x "$candidate" ]; then
+    context_mcp_bin="$candidate"
+  fi
 fi
 if [ -z "$context_mcp_bin" ]; then
   bundled_context_mcp="/Applications/Universal Context Manager.app/Contents/MacOS/context-mcp"

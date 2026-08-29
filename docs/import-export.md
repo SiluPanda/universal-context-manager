@@ -1,6 +1,34 @@
 # Import and export
 
-Import and export are implemented through `contextctl import`, `contextctl export`, and the desktop app archive flow.
+Portable UCM bundles use `contextctl import`, `contextctl export`, and the desktop archive flow.
+Existing harness instruction files use the staged `contextctl source-import` flow.
+
+## Import existing instructions
+
+Supported source families:
+
+- `AGENTS.md`
+- `CLAUDE.md` and `CLAUDE.local.md`
+- `.github/copilot-instructions.md`
+- `.github/instructions/*.instructions.md`
+- `.cursor/rules/*.mdc` and `.cursorrules`
+- `.continue/rules/*.md`
+- ordinary Markdown when explicitly selected
+
+Preview before applying:
+
+```bash
+contextctl source-import preview AGENTS.md --scope project
+contextctl source-import apply AGENTS.md --scope project
+```
+
+Preview reports the detected source type, destination, generated entry keys, duplicates,
+conflicts, review-policy outcome, and warnings. Apply is deterministic and skips unchanged
+duplicates.
+
+Markdown passed to the older `contextctl import --format markdown` command must be a UCM-exported
+Markdown bundle containing UCM metadata markers. Ordinary Markdown is rejected there rather than
+silently importing zero entries.
 
 ## Goals
 
@@ -23,7 +51,8 @@ Import and export are implemented through `contextctl import`, `contextctl expor
 ## Desktop archive flow
 
 - the desktop app writes the native core JSON bundle selected by the operator
-- JSON and Markdown are accepted on import; the desktop currently exports JSON
+- native UCM JSON and UCM-exported Markdown are accepted as archive imports; instruction files use
+  the separate staged preview flow
 - entry provenance and review state remain explicit in exported records
 - approved and rejected reviews retain their resolution note, timestamps, and current revision number on JSON round-trip
 - imported packs restore their current description, metadata, lifecycle status, and governance lock state even when the destination already contains the pack

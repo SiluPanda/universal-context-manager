@@ -48,6 +48,25 @@ Exports are explicit operator actions.
 **Residual risk:** SQLite and export bundles are not application-level encrypted in v1. Host disk
 encryption and careful handling of exported files remain the operator's responsibility.
 
+### Renderer-supplied filesystem paths
+
+A compromised or confused desktop renderer could attempt to read or truncate an arbitrary local
+file by calling an import or export command directly.
+
+**Current mitigation:** project, source-import, bundle-import, and export paths come from native
+dialogs and receive canonical, operation-specific, one-time grants. Tokens expire after ten
+minutes and are consumed on success or mismatch, so renderer-provided paths alone do not authorize
+filesystem access.
+
+### Confusing local storage with local inference
+
+An operator may assume that local-first persistence prevents a coding harness from sending context
+to its configured model provider.
+
+**Current mitigation:** product surfaces distinguish UCM's local storage/indexing from adapter
+delivery. Effective context is shown before delivery, and privacy guidance states that the
+receiving harness controls downstream model transmission.
+
 ### Multiple local writers
 Two daemons against one database could produce confusing concurrent state.
 

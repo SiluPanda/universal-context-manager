@@ -3,7 +3,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::error::{ContextError, ContextResult};
-use crate::model::{CommitWorkRequest, EntryInput, Provenance, ReviewItem, RunInput, ScopeRef};
+use crate::model::{
+    CommitWorkRequest, EntryInput, Provenance, ReviewItem, ReviewMode, RunInput, ScopeRef,
+};
 
 pub fn reject_if_secret(text: &str) -> ContextResult<()> {
     for (pattern, label) in secret_patterns() {
@@ -177,6 +179,21 @@ pub fn reject_entry_write_for_storage(
 
 pub fn reject_actor_for_storage(actor: &str) -> ContextResult<()> {
     reject_serialized_secret("actor", &json!({ "actor": actor }))
+}
+
+pub fn reject_review_policy_write_for_storage(
+    mode: ReviewMode,
+    metadata: &Value,
+    actor: &str,
+) -> ContextResult<()> {
+    reject_serialized_secret(
+        "review policy",
+        &json!({
+            "mode": mode,
+            "metadata": metadata,
+            "actor": actor,
+        }),
+    )
 }
 
 pub fn reject_revision_metadata_for_storage(

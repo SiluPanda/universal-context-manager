@@ -3,21 +3,26 @@ use crate::markdown::{
     export_markdown as bundle_to_markdown, import_markdown as bundle_from_markdown,
 };
 use crate::model::*;
+use crate::protocol::CONTEXT_API_VERSION;
 use crate::secret::{
     reject_commit_metadata_for_storage, reject_entry_write_for_storage,
-    reject_pack_write_for_storage, reject_review_for_storage, reject_review_transition_for_storage,
+    reject_pack_write_for_storage, reject_review_for_storage,
+    reject_review_policy_write_for_storage, reject_review_transition_for_storage,
     reject_revision_metadata_for_storage, reject_run_for_storage,
 };
+use crate::source_import::{ParsedSourceCandidate, parse_source_import};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::debug;
 
-const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 pub struct ContextStore {
     db_path: PathBuf,
@@ -35,6 +40,19 @@ struct EntryRow {
     _pack_id: String,
     content_hash: String,
     record: EntryRecord,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateCheck {
+    ReviewModeDefault,
+    ExactCandidate,
+}
+
+struct PreparedSourceImport {
+    destination: ScopeRef,
+    pack_name: String,
+    candidates: Vec<ParsedSourceCandidate>,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -70,6 +88,53 @@ impl ContextStore {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    pub fn get_review_policy(&self) -> ContextResult<ReviewPolicy> {
+        let conn = self.lock_conn()?;
+        get_review_policy_tx(&conn)
+    }
+
+    pub fn set_review_policy(
+        &self,
+        request: SetReviewPolicyRequest,
+    ) -> ContextResult<ReviewPolicy> {
+        validate_actor(&request.actor)?;
+        reject_review_policy_write_for_storage(request.mode, &request.metadata, &request.actor)?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let mut policy = get_review_policy_tx(&tx)?;
+        if policy.mode == request.mode && policy.metadata == request.metadata {
+            tx.commit()?;
+            return Ok(policy);
+        }
+
+        policy.mode = request.mode;
+        policy.metadata = request.metadata;
+        policy.updated_at = now_utc();
+        policy.updated_by = request.actor.clone();
+        policy.revision_no = record_revision(
+            &tx,
+            "policy",
+            "review",
+            "update",
+            &policy,
+            &Provenance::system(request.actor.clone(), "review_policy_update"),
+            None,
+            None,
+        )?;
+        tx.execute(
+            "UPDATE review_policy SET review_mode = ?, metadata_json = ?, updated_at = ?, updated_by = ?, current_revision_no = ? WHERE policy_key = 'review'",
+            params![
+                policy.mode.as_str(),
+                to_json_text(&policy.metadata)?,
+                policy.updated_at.to_rfc3339(),
+                policy.updated_by,
+                policy.revision_no,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(policy)
     }
 
     pub fn create_pack(&self, request: CreatePackRequest) -> ContextResult<PackRecord> {
@@ -421,10 +486,20 @@ impl ContextStore {
             }
         }
         let rendered_markdown = render_compose_markdown(&sections);
+        let exclusions = list_compose_exclusions(&conn, &request)?;
+        let metrics = ComposeMetrics {
+            rendered_bytes: rendered_markdown.len(),
+            estimated_tokens: estimate_tokens(&rendered_markdown),
+            included_entries: sections.iter().map(|section| section.entries.len()).sum(),
+            excluded_entries: exclusions.len(),
+        };
         Ok(ComposeResponse {
             generated_at: now_utc(),
             sections,
             rendered_markdown,
+            metrics,
+            exclusions,
+            warnings: Vec::new(),
         })
     }
 
@@ -474,72 +549,17 @@ impl ContextStore {
     }
 
     pub fn commit_work(&self, request: CommitWorkRequest) -> ContextResult<CommitWorkResult> {
-        validate_request_id(&request.request_id)?;
-        validate_actor(&request.actor)?;
-        if request.proposals.is_empty() {
-            return Err(ContextError::validation("proposals must not be empty"));
-        }
-        reject_commit_metadata_for_storage(&request)?;
+        self.commit_work_with_duplicate_check(request, DuplicateCheck::ReviewModeDefault)
+    }
+
+    fn commit_work_with_duplicate_check(
+        &self,
+        request: CommitWorkRequest,
+        duplicate_check: DuplicateCheck,
+    ) -> ContextResult<CommitWorkResult> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        if let Some(existing) = get_commit_result_tx(&tx, &request.request_id)? {
-            tx.commit()?;
-            return Ok(existing);
-        }
-        let run_id = if let Some(run) = request.run.clone() {
-            Some(ensure_run_tx(&tx, run)?.id)
-        } else {
-            None
-        };
-        let mut items = Vec::new();
-        for proposal in &request.proposals {
-            let scope = proposal.scope.normalize()?;
-            validate_pack_name(&proposal.pack_name)?;
-            proposal.entry.validate()?;
-            let provenance = proposal
-                .entry
-                .provenance
-                .clone()
-                .unwrap_or_else(|| Provenance {
-                    actor: request.actor.clone(),
-                    source: "commit_work".to_string(),
-                    source_ref: None,
-                    run_id: run_id.clone(),
-                    request_id: Some(request.request_id.clone()),
-                    note: None,
-                });
-            let item = commit_proposal_tx(
-                &tx,
-                &request.request_id,
-                run_id.as_deref(),
-                &scope,
-                &proposal.pack_name,
-                &proposal.entry,
-                &request.actor,
-                &provenance,
-            )?;
-            items.push(item);
-        }
-        let status = summarize_commit_status(&items);
-        let result = CommitWorkResult {
-            request_id: request.request_id.clone(),
-            status,
-            run_id,
-            items,
-            spooled: false,
-            spool_path: None,
-        };
-        tx.execute(
-            "INSERT INTO commits (request_id, run_id, request_json, result_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            params![
-                result.request_id,
-                result.run_id,
-                to_json_text(&redacted_commit_request(&request))?,
-                to_json_text(&result)?,
-                commit_status_str(&result.status),
-                now_utc().to_rfc3339(),
-            ],
-        )?;
+        let result = commit_work_tx(&tx, request, duplicate_check)?;
         tx.commit()?;
         Ok(result)
     }
@@ -634,28 +654,59 @@ impl ContextStore {
         if review.record.state != ReviewState::Pending {
             return Err(ContextError::validation("review is not pending"));
         }
-        if let Some(title) = request.title {
-            review.record.proposed_entry.title = Some(title);
-        }
-        if let Some(kind) = request.kind {
-            review.record.proposed_entry.kind = kind;
-        }
-        if let Some(value) = request.value {
-            review.record.proposed_entry.value = value;
-        }
-        if let Some(tags) = request.tags {
-            review.record.proposed_entry.tags = tags;
-        }
-        if let Some(metadata) = request.metadata {
-            review.record.proposed_entry.metadata = metadata;
-        }
-        if let Some(locked) = request.locked {
-            review.record.proposed_entry.locked = locked;
-        }
-        review.record.proposed_entry.validate()?;
-        reject_review_for_storage(&review.record)?;
+        apply_review_edit_fields(&mut review.record, &request)?;
         review.record.updated_at = now_utc();
         review.record.revision_no = update_review_tx(&tx, &review.record, &request.actor, "edit")?;
+        tx.commit()?;
+        Ok(review.record)
+    }
+
+    pub fn review_edit_and_approve(
+        &self,
+        request: ReviewEditAndApproveRequest,
+    ) -> ContextResult<ReviewItem> {
+        let note = request.note.clone();
+        let edit_request = ReviewEditRequest::from(request);
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        validate_actor(&edit_request.actor)?;
+        validate_review_id(&edit_request.review_id)?;
+        let mut review = get_review_tx(&tx, &edit_request.review_id)?
+            .ok_or_else(|| ContextError::not_found(format!("review {}", edit_request.review_id)))?;
+        if review.record.state != ReviewState::Pending {
+            return Err(ContextError::validation("review is not pending"));
+        }
+
+        apply_review_edit_fields(&mut review.record, &edit_request)?;
+        let provenance = review
+            .record
+            .proposed_entry
+            .provenance
+            .clone()
+            .unwrap_or_else(|| Provenance {
+                actor: edit_request.actor.clone(),
+                source: "review_edit_and_approve".to_string(),
+                source_ref: Some(review.record.id.clone()),
+                run_id: None,
+                request_id: Some(review.record.request_id.clone()),
+                note: note.clone(),
+            });
+        let _entry = apply_entry_tx(
+            &tx,
+            &review.record.scope,
+            &review.record.pack_name,
+            &review.record.proposed_entry,
+            &edit_request.actor,
+            &provenance,
+            Some(review.record.request_id.as_str()),
+            provenance.run_id.as_deref(),
+        )?;
+        review.record.state = ReviewState::Approved;
+        review.record.updated_at = now_utc();
+        review.record.resolution_note = note;
+        reject_review_for_storage(&review.record)?;
+        review.record.revision_no =
+            update_review_tx(&tx, &review.record, &edit_request.actor, "edit_and_approve")?;
         tx.commit()?;
         Ok(review.record)
     }
@@ -704,6 +755,154 @@ impl ContextStore {
                 Ok(bundle)
             }
         }
+    }
+
+    pub fn preview_source_import(
+        &self,
+        request: SourceImportPreviewRequest,
+    ) -> ContextResult<SourceImportPreview> {
+        let prepared = prepare_source_import(&request)?;
+        let conn = self.lock_conn()?;
+        build_source_import_preview(&conn, &request.actor, prepared)
+    }
+
+    pub fn apply_source_import(
+        &self,
+        request: SourceImportApplyRequest,
+    ) -> ContextResult<SourceImportApplyResult> {
+        let preview_request = SourceImportPreviewRequest::from(&request);
+        let prepared = prepare_source_import(&preview_request)?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let preview = build_source_import_preview(&tx, &request.actor, prepared)?;
+        if let Some(expected) = request.expected_preview_fingerprint.as_deref() {
+            if preview.preview_fingerprint.as_deref() != Some(expected) {
+                return Err(ContextError::conflict(
+                    "source import preview fingerprint no longer matches authoritative state; preview again",
+                ));
+            }
+        }
+        if !preview.apply_allowed {
+            return Err(ContextError::validation(format!(
+                "source import preview does not allow apply: {}",
+                preview.warnings.join("; ")
+            )));
+        }
+        let request_id = source_import_request_id(&preview)?;
+        let mut items = Vec::with_capacity(preview.candidates.len());
+        for candidate in &preview.candidates {
+            if candidate.disposition == SourceImportDisposition::Duplicate {
+                items.push(SourceImportApplyItem {
+                    candidate_index: candidate.candidate_index,
+                    document_index: candidate.document_index,
+                    source_path: candidate.source_path.clone(),
+                    entry_key: candidate.entry.key.clone(),
+                    disposition: CommitDisposition::Duplicate,
+                    reason: None,
+                    entry_id: candidate.existing_entry_id.clone(),
+                    review_id: None,
+                });
+                continue;
+            }
+
+            let candidate_request_id =
+                source_import_candidate_request_id(&request.actor, &preview, candidate)?;
+            let mut entry = candidate.entry.clone();
+            if let Some(provenance) = entry.provenance.as_mut() {
+                provenance.request_id = Some(candidate_request_id.clone());
+            }
+            let result = commit_work_tx(
+                &tx,
+                CommitWorkRequest {
+                    request_id: candidate_request_id,
+                    actor: request.actor.clone(),
+                    run: None,
+                    proposals: vec![CommitProposal {
+                        scope: preview.destination.clone(),
+                        pack_name: preview.pack_name.clone(),
+                        entry,
+                    }],
+                },
+                DuplicateCheck::ExactCandidate,
+            )?;
+            let result_item =
+                result.items.into_iter().next().ok_or_else(|| {
+                    ContextError::validation("source import commit returned no item")
+                })?;
+            items.push(SourceImportApplyItem {
+                candidate_index: candidate.candidate_index,
+                document_index: candidate.document_index,
+                source_path: candidate.source_path.clone(),
+                entry_key: result_item.entry_key,
+                disposition: result_item.disposition,
+                reason: result_item.reason,
+                entry_id: result_item.entry_id,
+                review_id: result_item.review_id,
+            });
+        }
+        items.sort_by_key(|item| item.candidate_index);
+
+        let applied_count = items
+            .iter()
+            .filter(|item| item.disposition == CommitDisposition::Applied)
+            .count();
+        let pending_count = items
+            .iter()
+            .filter(|item| item.disposition == CommitDisposition::Pending)
+            .count();
+        let rejected_count = items
+            .iter()
+            .filter(|item| item.disposition == CommitDisposition::Rejected)
+            .count();
+        let skipped_count = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.disposition,
+                    CommitDisposition::Duplicate | CommitDisposition::Rejected
+                )
+            })
+            .count();
+        let affected_entry_ids = items
+            .iter()
+            .filter(|item| item.disposition == CommitDisposition::Applied)
+            .filter_map(|item| item.entry_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let affected_review_ids = items
+            .iter()
+            .filter_map(|item| item.review_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let affected_entry_keys = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.disposition,
+                    CommitDisposition::Applied | CommitDisposition::Pending
+                )
+            })
+            .map(|item| item.entry_key.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let result = SourceImportApplyResult {
+            request_id,
+            candidate_count: preview.candidates.len(),
+            imported_count: applied_count + pending_count,
+            applied_count,
+            pending_count,
+            skipped_count,
+            rejected_count,
+            items,
+            affected_entry_ids,
+            affected_review_ids,
+            affected_entry_keys,
+        };
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn import_bundle(&self, bundle: ContextExportBundle, actor: &str) -> ContextResult<()> {
@@ -786,8 +985,17 @@ impl ContextStore {
     }
 
     pub fn health(&self) -> ContextResult<HealthReport> {
+        self.health_with_component_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn health_with_component_version(
+        &self,
+        component_version: &str,
+    ) -> ContextResult<HealthReport> {
         let stats = self.stats()?;
         Ok(HealthReport {
+            component_version: Some(component_version.to_string()),
+            api_version: Some(CONTEXT_API_VERSION),
             schema_version: stats.schema_version,
             packs: stats.packs,
             entries: stats.entries,
@@ -861,6 +1069,7 @@ impl ContextStore {
                 2 => migration_v2(&tx)?,
                 3 => migration_v3(&tx)?,
                 4 => migration_v4(&tx)?,
+                5 => migration_v5(&tx)?,
                 _ => {
                     return Err(ContextError::validation(format!(
                         "unknown migration {version}"
@@ -1259,6 +1468,102 @@ fn migration_v4(tx: &Transaction<'_>) -> ContextResult<()> {
     Ok(())
 }
 
+fn migration_v5(tx: &Transaction<'_>) -> ContextResult<()> {
+    tx.execute_batch(
+        r#"
+        CREATE TABLE revisions_v5 (
+            id TEXT PRIMARY KEY NOT NULL,
+            entity_type TEXT NOT NULL CHECK (entity_type IN ('pack', 'entry', 'review', 'policy')),
+            entity_id TEXT NOT NULL,
+            revision_no INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+            provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
+            commit_request_id TEXT,
+            run_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (entity_type, entity_id, revision_no)
+        ) STRICT;
+
+        INSERT INTO revisions_v5
+        SELECT id, entity_type, entity_id, revision_no, action, snapshot_json, provenance_json,
+               commit_request_id, run_id, created_at
+        FROM revisions;
+        DROP TABLE revisions;
+        ALTER TABLE revisions_v5 RENAME TO revisions;
+        CREATE INDEX idx_revisions_entity
+            ON revisions(entity_type, entity_id, revision_no DESC);
+
+        CREATE TABLE review_items_v5 (
+            id TEXT PRIMARY KEY NOT NULL,
+            request_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'project', 'task')),
+            scope_id TEXT NOT NULL,
+            pack_name TEXT NOT NULL,
+            entry_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'rejected')),
+            reason TEXT NOT NULL CHECK (reason IN ('global_scope', 'conflict', 'locked', 'strict_policy')),
+            proposed_entry_json TEXT NOT NULL CHECK (json_valid(proposed_entry_json)),
+            existing_entry_json TEXT,
+            resolution_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            current_revision_no INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+
+        INSERT INTO review_items_v5
+        SELECT id, request_id, scope_kind, scope_id, pack_name, entry_key, state, reason,
+               proposed_entry_json, existing_entry_json, resolution_note, created_at, updated_at,
+               current_revision_no
+        FROM review_items;
+        DROP TABLE review_items;
+        ALTER TABLE review_items_v5 RENAME TO review_items;
+        CREATE INDEX idx_review_state ON review_items(state, created_at);
+
+        CREATE TABLE review_policy (
+            policy_key TEXT PRIMARY KEY NOT NULL CHECK (policy_key = 'review'),
+            review_mode TEXT NOT NULL CHECK (review_mode IN ('strict', 'balanced', 'fast')),
+            metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL,
+            current_revision_no INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+        "#,
+    )?;
+
+    let now = now_utc();
+    let mut policy = ReviewPolicy {
+        mode: ReviewMode::Balanced,
+        metadata: default_json_object(),
+        updated_at: now,
+        updated_by: "system".to_string(),
+        revision_no: 0,
+    };
+    tx.execute(
+        "INSERT INTO review_policy (policy_key, review_mode, metadata_json, updated_at, updated_by, current_revision_no) VALUES ('review', 'balanced', ?, ?, ?, 0)",
+        params![
+            to_json_text(&policy.metadata)?,
+            policy.updated_at.to_rfc3339(),
+            policy.updated_by,
+        ],
+    )?;
+    policy.revision_no = record_revision(
+        tx,
+        "policy",
+        "review",
+        "create",
+        &policy,
+        &Provenance::system("system", "migration_v5"),
+        None,
+        None,
+    )?;
+    tx.execute(
+        "UPDATE review_policy SET current_revision_no = ? WHERE policy_key = 'review'",
+        params![policy.revision_no],
+    )?;
+    Ok(())
+}
+
 fn current_schema_version(conn: &Connection) -> ContextResult<i64> {
     Ok(conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -1481,6 +1786,263 @@ fn apply_entry_tx_inner(
     Ok(record)
 }
 
+fn prepare_source_import(
+    request: &SourceImportPreviewRequest,
+) -> ContextResult<PreparedSourceImport> {
+    validate_actor(&request.actor)?;
+    let destination = request.destination.normalize()?;
+    let pack_name = request.pack_name.clone().unwrap_or_else(default_pack_name);
+    validate_pack_name(&pack_name)?;
+    let (candidates, warnings) = parse_source_import(request)?;
+    Ok(PreparedSourceImport {
+        destination,
+        pack_name,
+        candidates,
+        warnings,
+    })
+}
+
+fn build_source_import_preview(
+    conn: &Connection,
+    actor: &str,
+    prepared: PreparedSourceImport,
+) -> ContextResult<SourceImportPreview> {
+    let PreparedSourceImport {
+        destination,
+        pack_name,
+        candidates: parsed_candidates,
+        mut warnings,
+    } = prepared;
+    let review_mode = get_review_policy_tx(conn)?.mode;
+    let destination_pack = match get_pack_tx(conn, &destination, &pack_name)? {
+        Some(pack) => SourceImportPackGovernance {
+            exists: true,
+            status: Some(pack.record.status),
+            locked: pack.record.locked,
+            lock_reason: pack.record.lock_reason,
+            revision_no: Some(pack.record.revision_no),
+        },
+        None => SourceImportPackGovernance::default(),
+    };
+    let mut candidates = Vec::with_capacity(parsed_candidates.len());
+    for (candidate_index, parsed) in parsed_candidates.into_iter().enumerate() {
+        parsed.entry.validate()?;
+        let provenance = parsed
+            .entry
+            .provenance
+            .as_ref()
+            .ok_or_else(|| ContextError::validation("source import provenance is required"))?;
+        reject_entry_write_for_storage(
+            &destination,
+            &pack_name,
+            actor,
+            &parsed.entry,
+            provenance,
+            None,
+            None,
+        )?;
+        let existing = get_entry_tx(conn, &destination, &pack_name, &parsed.entry.key)?;
+        let disposition = match existing.as_ref() {
+            Some(existing)
+                if existing.record.status == EntryStatus::Active
+                    && entry_record_matches_input(&existing.record, &parsed.entry) =>
+            {
+                SourceImportDisposition::Duplicate
+            }
+            Some(existing) if existing.record.status == EntryStatus::Active => {
+                SourceImportDisposition::Conflict
+            }
+            _ => SourceImportDisposition::New,
+        };
+        let mut candidate_warnings = parsed.warnings;
+        match disposition {
+            SourceImportDisposition::Duplicate => candidate_warnings
+                .push("an identical active entry already exists and will be skipped".to_string()),
+            SourceImportDisposition::Conflict => candidate_warnings.push(
+                "an active entry with the same key has different content or governance state"
+                    .to_string(),
+            ),
+            SourceImportDisposition::New => {}
+        }
+        if destination_pack.status == Some(PackStatus::Archived) {
+            candidate_warnings
+                .push("destination pack is archived and cannot accept source imports".to_string());
+        } else if destination_pack.locked && disposition != SourceImportDisposition::Duplicate {
+            candidate_warnings
+                .push("destination pack is locked; this candidate will require review".to_string());
+        }
+        candidates.push(SourceImportCandidate {
+            candidate_index,
+            document_index: parsed.document_index,
+            source_path: parsed.source_path,
+            detected_source_kind: parsed.detected_source_kind,
+            entry: parsed.entry,
+            disposition,
+            existing_entry_id: existing.as_ref().map(|row| row.record.id.clone()),
+            existing_revision_no: existing.as_ref().map(|row| row.record.revision_no),
+            warnings: candidate_warnings,
+        });
+    }
+    let mut seen_keys = BTreeSet::new();
+    let duplicate_keys = candidates
+        .iter()
+        .filter_map(|candidate| {
+            if seen_keys.insert(candidate.entry.key.clone()) {
+                None
+            } else {
+                Some(candidate.entry.key.clone())
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    let mut apply_allowed = duplicate_keys.is_empty();
+    if !apply_allowed {
+        warnings.push(format!(
+            "multiple candidates map to the same destination key: {}",
+            duplicate_keys.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if destination_pack.status == Some(PackStatus::Archived) {
+        apply_allowed = false;
+        warnings.push(format!(
+            "destination pack {pack_name} is archived; unarchive it before applying source import"
+        ));
+    } else if destination_pack.locked
+        && candidates
+            .iter()
+            .any(|candidate| candidate.disposition != SourceImportDisposition::Duplicate)
+    {
+        warnings.push(format!(
+            "destination pack {pack_name} is locked; non-duplicate candidates will require review"
+        ));
+    }
+
+    let mut preview = SourceImportPreview {
+        destination,
+        pack_name,
+        review_mode,
+        destination_pack,
+        preview_fingerprint: None,
+        candidates,
+        warnings,
+        apply_allowed,
+    };
+    preview.preview_fingerprint = Some(source_import_preview_fingerprint(actor, &preview)?);
+    Ok(preview)
+}
+
+fn source_import_preview_fingerprint(
+    actor: &str,
+    preview: &SourceImportPreview,
+) -> ContextResult<String> {
+    let canonical = json!({
+        "contract": "source_import_preview_v1",
+        "destination": &preview.destination,
+        "pack_name": &preview.pack_name,
+        "actor": actor,
+        "review_mode": preview.review_mode,
+        "destination_pack": &preview.destination_pack,
+        "candidates": &preview.candidates,
+        "warnings": &preview.warnings,
+        "apply_allowed": preview.apply_allowed,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&canonicalize_json_value(canonical))?);
+    Ok(format!("source-import-preview-v1:{:x}", hasher.finalize()))
+}
+
+fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json_value(value)))
+                    .collect(),
+            )
+        }
+        other => other,
+    }
+}
+
+fn commit_work_tx(
+    tx: &Transaction<'_>,
+    request: CommitWorkRequest,
+    duplicate_check: DuplicateCheck,
+) -> ContextResult<CommitWorkResult> {
+    validate_request_id(&request.request_id)?;
+    validate_actor(&request.actor)?;
+    if request.proposals.is_empty() {
+        return Err(ContextError::validation("proposals must not be empty"));
+    }
+    reject_commit_metadata_for_storage(&request)?;
+    if let Some(existing) = get_commit_result_tx(tx, &request.request_id)? {
+        return Ok(existing);
+    }
+    let review_mode = get_review_policy_tx(tx)?.mode;
+    let run_id = if let Some(run) = request.run.clone() {
+        Some(ensure_run_tx(tx, run)?.id)
+    } else {
+        None
+    };
+    let mut items = Vec::new();
+    for proposal in &request.proposals {
+        let scope = proposal.scope.normalize()?;
+        validate_pack_name(&proposal.pack_name)?;
+        proposal.entry.validate()?;
+        let provenance = proposal
+            .entry
+            .provenance
+            .clone()
+            .unwrap_or_else(|| Provenance {
+                actor: request.actor.clone(),
+                source: "commit_work".to_string(),
+                source_ref: None,
+                run_id: run_id.clone(),
+                request_id: Some(request.request_id.clone()),
+                note: None,
+            });
+        let item = commit_proposal_tx(
+            tx,
+            &request.request_id,
+            run_id.as_deref(),
+            &scope,
+            &proposal.pack_name,
+            &proposal.entry,
+            &request.actor,
+            &provenance,
+            review_mode,
+            duplicate_check,
+        )?;
+        items.push(item);
+    }
+    let status = summarize_commit_status(&items);
+    let result = CommitWorkResult {
+        request_id: request.request_id.clone(),
+        status,
+        run_id,
+        items,
+        spooled: false,
+        spool_path: None,
+    };
+    tx.execute(
+        "INSERT INTO commits (request_id, run_id, request_json, result_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        params![
+            result.request_id,
+            result.run_id,
+            to_json_text(&redacted_commit_request(&request))?,
+            to_json_text(&result)?,
+            commit_status_str(&result.status),
+            now_utc().to_rfc3339(),
+        ],
+    )?;
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit_proposal_tx(
     tx: &Transaction<'_>,
@@ -1491,6 +2053,8 @@ fn commit_proposal_tx(
     entry: &EntryInput,
     actor: &str,
     provenance: &Provenance,
+    review_mode: ReviewMode,
+    duplicate_check: DuplicateCheck,
 ) -> ContextResult<CommitItemResult> {
     let existing = get_entry_tx(tx, scope, pack_name, &entry.key)?;
     if let Err(err) = reject_entry_write_for_storage(
@@ -1512,29 +2076,60 @@ fn commit_proposal_tx(
             review_id: None,
         });
     }
-    let pack = ensure_pack_tx(
-        tx,
-        scope,
-        pack_name,
-        actor,
-        None,
-        default_json_object(),
-        false,
-        None,
-    )?;
-    if let Err(err) = reject_archived_pack_mutation(&pack, "write entries to") {
+    let pack = if duplicate_check == DuplicateCheck::ExactCandidate {
+        get_pack_tx(tx, scope, pack_name)?.map(|row| row.record)
+    } else {
+        Some(ensure_pack_tx(
+            tx,
+            scope,
+            pack_name,
+            actor,
+            None,
+            default_json_object(),
+            false,
+            None,
+        )?)
+    };
+    if let Some(pack) = &pack {
+        if let Err(err) = reject_archived_pack_mutation(pack, "write entries to") {
+            return Ok(CommitItemResult {
+                scope: scope.clone(),
+                pack_name: pack_name.to_string(),
+                entry_key: entry.key.clone(),
+                disposition: CommitDisposition::Rejected,
+                reason: Some(err.to_string()),
+                entry_id: existing.as_ref().map(|row| row.record.id.clone()),
+                review_id: None,
+            });
+        }
+    }
+    let content_hash = entry.content_hash();
+    let is_duplicate = existing
+        .as_ref()
+        .map(|row| {
+            row.record.status == EntryStatus::Active
+                && if review_mode == ReviewMode::Strict
+                    || duplicate_check == DuplicateCheck::ExactCandidate
+                {
+                    entry_record_matches_input(&row.record, entry)
+                } else {
+                    row.content_hash == content_hash
+                }
+        })
+        .unwrap_or(false);
+    if review_mode == ReviewMode::Strict && is_duplicate {
         return Ok(CommitItemResult {
             scope: scope.clone(),
             pack_name: pack_name.to_string(),
             entry_key: entry.key.clone(),
-            disposition: CommitDisposition::Rejected,
-            reason: Some(err.to_string()),
+            disposition: CommitDisposition::Duplicate,
+            reason: None,
             entry_id: existing.as_ref().map(|row| row.record.id.clone()),
             review_id: None,
         });
     }
     if scope.kind == ScopeKind::Global {
-        let review = insert_review_item_tx(
+        let review = insert_or_reuse_review_item_tx(
             tx,
             request_id,
             scope,
@@ -1542,6 +2137,7 @@ fn commit_proposal_tx(
             entry,
             existing.map(|row| row.record),
             ReviewReason::GlobalScope,
+            duplicate_check,
         )?;
         return Ok(CommitItemResult {
             scope: scope.clone(),
@@ -1553,13 +2149,13 @@ fn commit_proposal_tx(
             review_id: Some(review.id),
         });
     }
-    if pack.locked
+    if pack.as_ref().map(|pack| pack.locked).unwrap_or(false)
         || existing
             .as_ref()
             .map(|row| row.record.locked)
             .unwrap_or(false)
     {
-        let review = insert_review_item_tx(
+        let review = insert_or_reuse_review_item_tx(
             tx,
             request_id,
             scope,
@@ -1567,6 +2163,7 @@ fn commit_proposal_tx(
             entry,
             existing.map(|row| row.record),
             ReviewReason::Locked,
+            duplicate_check,
         )?;
         return Ok(CommitItemResult {
             scope: scope.clone(),
@@ -1578,9 +2175,38 @@ fn commit_proposal_tx(
             review_id: Some(review.id),
         });
     }
-    let content_hash = entry.content_hash();
+    if review_mode == ReviewMode::Strict {
+        let reason = if existing
+            .as_ref()
+            .map(|row| row.record.status == EntryStatus::Active)
+            .unwrap_or(false)
+        {
+            ReviewReason::Conflict
+        } else {
+            ReviewReason::StrictPolicy
+        };
+        let review = insert_or_reuse_review_item_tx(
+            tx,
+            request_id,
+            scope,
+            pack_name,
+            entry,
+            existing.map(|row| row.record),
+            reason.clone(),
+            duplicate_check,
+        )?;
+        return Ok(CommitItemResult {
+            scope: scope.clone(),
+            pack_name: pack_name.to_string(),
+            entry_key: entry.key.clone(),
+            disposition: CommitDisposition::Pending,
+            reason: Some(reason.as_str().to_string()),
+            entry_id: None,
+            review_id: Some(review.id),
+        });
+    }
     if let Some(existing) = existing {
-        if existing.record.status == EntryStatus::Active && existing.content_hash == content_hash {
+        if is_duplicate {
             return Ok(CommitItemResult {
                 scope: scope.clone(),
                 pack_name: pack_name.to_string(),
@@ -1591,8 +2217,8 @@ fn commit_proposal_tx(
                 review_id: None,
             });
         }
-        if existing.record.status == EntryStatus::Active && existing.content_hash != content_hash {
-            let review = insert_review_item_tx(
+        if review_mode == ReviewMode::Balanced && existing.record.status == EntryStatus::Active {
+            let review = insert_or_reuse_review_item_tx(
                 tx,
                 request_id,
                 scope,
@@ -1600,6 +2226,7 @@ fn commit_proposal_tx(
                 entry,
                 Some(existing.record),
                 ReviewReason::Conflict,
+                duplicate_check,
             )?;
             return Ok(CommitItemResult {
                 scope: scope.clone(),
@@ -1631,6 +2258,66 @@ fn commit_proposal_tx(
         entry_id: Some(applied.id),
         review_id: None,
     })
+}
+
+fn apply_review_edit_fields(
+    review: &mut ReviewItem,
+    request: &ReviewEditRequest,
+) -> ContextResult<()> {
+    if let Some(title) = &request.title {
+        review.proposed_entry.title = Some(title.clone());
+    }
+    if let Some(kind) = &request.kind {
+        review.proposed_entry.kind = kind.clone();
+    }
+    if let Some(value) = &request.value {
+        review.proposed_entry.value = value.clone();
+    }
+    if let Some(tags) = &request.tags {
+        review.proposed_entry.tags = tags.clone();
+    }
+    if let Some(metadata) = &request.metadata {
+        review.proposed_entry.metadata = metadata.clone();
+    }
+    if let Some(locked) = request.locked {
+        review.proposed_entry.locked = locked;
+    }
+    review.proposed_entry.validate()?;
+    reject_review_for_storage(review)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_or_reuse_review_item_tx(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    scope: &ScopeRef,
+    pack_name: &str,
+    entry: &EntryInput,
+    existing_entry: Option<EntryRecord>,
+    reason: ReviewReason,
+    duplicate_check: DuplicateCheck,
+) -> ContextResult<ReviewItem> {
+    if duplicate_check == DuplicateCheck::ExactCandidate {
+        if let Some(review) = find_matching_pending_review_tx(
+            tx,
+            scope,
+            pack_name,
+            entry,
+            existing_entry.as_ref(),
+            &reason,
+        )? {
+            return Ok(review);
+        }
+    }
+    insert_review_item_tx(
+        tx,
+        request_id,
+        scope,
+        pack_name,
+        entry,
+        existing_entry,
+        reason,
+    )
 }
 
 fn insert_review_item_tx(
@@ -1921,6 +2608,26 @@ fn reject_archived_pack_update(
     )))
 }
 
+fn get_review_policy_tx(conn: &Connection) -> ContextResult<ReviewPolicy> {
+    conn.query_row(
+        "SELECT review_mode, metadata_json, updated_at, updated_by, current_revision_no FROM review_policy WHERE policy_key = 'review'",
+        [],
+        |row| {
+            Ok(ReviewPolicy {
+                mode: row
+                    .get::<_, String>(0)?
+                    .parse::<ReviewMode>()
+                    .map_err(to_sql_err)?,
+                metadata: from_json_text(&row.get::<_, String>(1)?).map_err(to_sql_err)?,
+                updated_at: parse_ts(&row.get::<_, String>(2)?).map_err(to_sql_err)?,
+                updated_by: row.get(3)?,
+                revision_no: row.get(4)?,
+            })
+        },
+    )
+    .map_err(ContextError::from)
+}
+
 fn get_pack_tx(conn: &Connection, scope: &ScopeRef, name: &str) -> ContextResult<Option<PackRow>> {
     conn.query_row(
         "SELECT id, scope_kind, scope_id, name, description, metadata_json, status, locked, lock_reason, created_at, updated_at, current_revision_no FROM packs WHERE scope_kind = ? AND scope_id = ? AND name = ?",
@@ -1954,6 +2661,41 @@ fn get_review_tx(conn: &Connection, review_id: &str) -> ContextResult<Option<Rev
     )
     .optional()
     .map_err(ContextError::from)
+}
+
+fn find_matching_pending_review_tx(
+    conn: &Connection,
+    scope: &ScopeRef,
+    pack_name: &str,
+    entry: &EntryInput,
+    existing_entry: Option<&EntryRecord>,
+    reason: &ReviewReason,
+) -> ContextResult<Option<ReviewItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, request_id, scope_kind, scope_id, pack_name, entry_key, state, reason, proposed_entry_json, existing_entry_json, resolution_note, created_at, updated_at, current_revision_no
+         FROM review_items
+         WHERE state = 'pending' AND scope_kind = ? AND scope_id = ? AND pack_name = ? AND entry_key = ? AND reason = ?
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            scope.kind.as_str(),
+            scope.id,
+            pack_name,
+            entry.key,
+            reason.as_str(),
+        ],
+        map_review_row,
+    )?;
+    for row in rows {
+        let review = row?.record;
+        if entry_inputs_match(&review.proposed_entry, entry)
+            && review.existing_entry.as_ref() == existing_entry
+        {
+            return Ok(Some(review));
+        }
+    }
+    Ok(None)
 }
 
 fn get_commit_result_tx(
@@ -2099,6 +2841,49 @@ fn delete_fts_tx(tx: &Transaction<'_>, entry_id: &str) -> ContextResult<()> {
     Ok(())
 }
 
+fn list_compose_exclusions(
+    conn: &Connection,
+    request: &ComposeRequest,
+) -> ContextResult<Vec<ComposeExclusion>> {
+    let filters = compose_filters(request)?;
+    let mut sql = String::from(
+        "SELECT e.id, p.scope_kind, p.scope_id, p.name, e.entry_key, e.current_revision_no, e.status, p.status FROM entries e JOIN packs p ON p.id = e.pack_id WHERE (e.status = 'deleted'",
+    );
+    if !request.include_archived {
+        sql.push_str(" OR p.status = 'archived'");
+    }
+    sql.push(')');
+    if !filters.is_empty() {
+        sql.push_str(" AND (");
+        sql.push_str(&filters.join(" OR "));
+        sql.push(')');
+    }
+    sql.push_str(
+        " ORDER BY CASE p.scope_kind WHEN 'global' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, p.scope_id, p.name, e.entry_key",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        let entry_status: String = row.get(6)?;
+        Ok(ComposeExclusion {
+            entry_id: row.get(0)?,
+            scope: ScopeRef::normalized(
+                row.get::<_, String>(1)?.parse().map_err(to_sql_err)?,
+                row.get::<_, String>(2)?,
+            )
+            .map_err(to_sql_err)?,
+            pack_name: row.get(3)?,
+            entry_key: row.get(4)?,
+            revision_no: row.get(5)?,
+            reason: if entry_status == EntryStatus::Deleted.as_str() {
+                ComposeExclusionReason::DeletedEntry
+            } else {
+                ComposeExclusionReason::ArchivedPack
+            },
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn render_compose_markdown(sections: &[ComposeSection]) -> String {
     let mut out = String::new();
     for section in sections {
@@ -2117,6 +2902,82 @@ fn render_compose_markdown(sections: &[ComposeSection]) -> String {
         }
     }
     out.trim().to_string()
+}
+
+fn estimate_tokens(rendered: &str) -> usize {
+    rendered.chars().count().div_ceil(4)
+}
+
+fn entry_record_matches_input(record: &EntryRecord, input: &EntryInput) -> bool {
+    // Source-import apply adds its stable request ID after preview. Provenance
+    // is therefore intentionally excluded while all durable entry fields and
+    // governance state compare exactly in both stages.
+    record.key == input.key
+        && record.title == input.title
+        && record.kind == input.kind
+        && record.value == input.value
+        && record.tags == input.tags
+        && record.metadata == input.metadata
+        && record.locked == input.locked
+}
+
+fn entry_inputs_match(left: &EntryInput, right: &EntryInput) -> bool {
+    left.key == right.key
+        && left.title == right.title
+        && left.kind == right.kind
+        && left.value == right.value
+        && left.tags == right.tags
+        && left.metadata == right.metadata
+        && left.locked == right.locked
+}
+
+fn source_import_request_id(preview: &SourceImportPreview) -> ContextResult<String> {
+    let canonical = json!({
+        "contract": "source_import_apply_v2",
+        "preview_fingerprint": preview.preview_fingerprint,
+        "destination": preview.destination,
+        "pack_name": preview.pack_name,
+        "candidates": preview.candidates.iter().map(|candidate| {
+            json!({
+                "candidate_index": candidate.candidate_index,
+                "document_index": candidate.document_index,
+                "source_path": candidate.source_path,
+                "detected_source_kind": candidate.detected_source_kind,
+                "entry": {
+                    "key": candidate.entry.key,
+                    "title": candidate.entry.title,
+                    "kind": candidate.entry.kind,
+                    "value": candidate.entry.value,
+                    "tags": candidate.entry.tags,
+                    "metadata": candidate.entry.metadata,
+                    "locked": candidate.entry.locked,
+                },
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&canonicalize_json_value(canonical))?);
+    Ok(format!("source-import-{:x}", hasher.finalize()))
+}
+
+fn source_import_candidate_request_id(
+    actor: &str,
+    preview: &SourceImportPreview,
+    candidate: &SourceImportCandidate,
+) -> ContextResult<String> {
+    let canonical = json!({
+        "contract": "source_import_candidate_v2",
+        "preview_fingerprint": preview.preview_fingerprint,
+        "destination": preview.destination,
+        "pack_name": preview.pack_name,
+        "actor": actor,
+        "review_mode": preview.review_mode,
+        "destination_pack": preview.destination_pack,
+        "candidate": candidate,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&canonicalize_json_value(canonical))?);
+    Ok(format!("source-import-candidate-{:x}", hasher.finalize()))
 }
 
 fn redacted_commit_request(request: &CommitWorkRequest) -> Value {
@@ -2422,8 +3283,193 @@ mod tests {
         }
     }
 
+    fn pending_global_review(
+        store: &ContextStore,
+        request_id: &str,
+        key: &str,
+        body: &str,
+    ) -> ReviewItem {
+        let result = store
+            .commit_work(CommitWorkRequest {
+                request_id: request_id.to_string(),
+                actor: "agent".to_string(),
+                run: None,
+                proposals: vec![CommitProposal {
+                    scope: ScopeRef::global(),
+                    pack_name: "main".to_string(),
+                    entry: sample_entry(key, body),
+                }],
+            })
+            .expect("pending commit");
+        let review_id = result.items[0].review_id.as_deref().expect("review id");
+        store
+            .review_list(Some(ReviewState::Pending))
+            .expect("pending reviews")
+            .into_iter()
+            .find(|review| review.id == review_id)
+            .expect("pending review")
+    }
+
+    fn find_review(store: &ContextStore, review_id: &str) -> ReviewItem {
+        store
+            .review_list(None)
+            .expect("reviews")
+            .into_iter()
+            .find(|review| review.id == review_id)
+            .expect("review")
+    }
+
     fn synthetic_secret(prefix: &str) -> String {
         [prefix, "abcdefghijklmnopqrstuvwxyz123456"].concat()
+    }
+
+    fn instruction_source_import_request(
+        destination: ScopeRef,
+        payload: &str,
+    ) -> SourceImportApplyRequest {
+        SourceImportApplyRequest {
+            source_kind: SourceImportKind::AgentsMd,
+            documents: vec![SourceImportDocument {
+                path: Some("AGENTS.md".to_string()),
+                payload: payload.to_string(),
+            }],
+            destination,
+            pack_name: Some("instructions".to_string()),
+            actor: "importer".to_string(),
+            expected_preview_fingerprint: None,
+        }
+    }
+
+    fn locked_source_import_request(destination: ScopeRef) -> SourceImportApplyRequest {
+        let source = ContextStore::open_in_memory().expect("source store");
+        source
+            .put_entry(PutEntryRequest {
+                scope: ScopeRef::global(),
+                pack_name: "main".to_string(),
+                entry: EntryInput {
+                    locked: true,
+                    ..sample_entry("governed", "unchanged body")
+                },
+                actor: "source-author".to_string(),
+            })
+            .expect("source entry");
+        let payload = source
+            .export_json(ExportRequest {
+                project_scope_id: None,
+                task_scope_id: None,
+                scope: None,
+                pack_name: None,
+                include_deleted: false,
+                include_reviews: false,
+                include_runs: false,
+            })
+            .expect("source export");
+
+        SourceImportApplyRequest {
+            source_kind: SourceImportKind::UcmJson,
+            documents: vec![SourceImportDocument {
+                path: Some("locked-bundle.json".to_string()),
+                payload,
+            }],
+            destination,
+            pack_name: Some("imports".to_string()),
+            actor: "importer".to_string(),
+            expected_preview_fingerprint: None,
+        }
+    }
+
+    fn seed_unlocked_source_import_candidate(
+        store: &ContextStore,
+        request: &SourceImportApplyRequest,
+    ) -> (EntrySelector, SourceImportPreview) {
+        let initial = store
+            .preview_source_import(request.into())
+            .expect("initial preview");
+        assert_eq!(initial.candidates.len(), 1);
+        assert_eq!(
+            initial.candidates[0].disposition,
+            SourceImportDisposition::New
+        );
+        assert!(initial.candidates[0].entry.locked);
+
+        let mut existing = initial.candidates[0].entry.clone();
+        existing.locked = false;
+        store
+            .put_entry(PutEntryRequest {
+                scope: initial.destination.clone(),
+                pack_name: initial.pack_name.clone(),
+                entry: existing,
+                actor: "seed".to_string(),
+            })
+            .expect("seed unlocked candidate");
+
+        let selector = EntrySelector {
+            scope: initial.destination,
+            pack_name: initial.pack_name,
+            entry_key: initial.candidates[0].entry.key.clone(),
+        };
+        let conflict = store
+            .preview_source_import(request.into())
+            .expect("conflict preview");
+        assert_eq!(
+            conflict.candidates[0].disposition,
+            SourceImportDisposition::Conflict
+        );
+        (selector, conflict)
+    }
+
+    fn set_review_mode(store: &ContextStore, mode: ReviewMode) {
+        store
+            .set_review_policy(SetReviewPolicyRequest {
+                mode,
+                metadata: json!({}),
+                actor: "admin".to_string(),
+            })
+            .expect("review policy");
+    }
+
+    fn create_import_pack(store: &ContextStore, scope: ScopeRef) -> PackRecord {
+        store
+            .create_pack(CreatePackRequest {
+                scope,
+                name: "instructions".to_string(),
+                description: None,
+                metadata: json!({}),
+                locked: false,
+                lock_reason: None,
+                actor: "pack-owner".to_string(),
+            })
+            .expect("destination pack")
+    }
+
+    fn assert_lock_only_source_import_is_reviewed(mode: ReviewMode) {
+        let store = temp_store();
+        set_review_mode(&store, mode);
+        let request = locked_source_import_request(
+            ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope"),
+        );
+        let (selector, preview) = seed_unlocked_source_import_candidate(&store, &request);
+        assert_eq!(preview.review_mode, mode);
+
+        let result = store.apply_source_import(request).expect("apply import");
+        assert_eq!(result.applied_count, 0);
+        assert_eq!(result.pending_count, 1);
+        assert_eq!(result.items[0].disposition, CommitDisposition::Pending);
+        assert_eq!(
+            result.items[0].reason.as_deref(),
+            Some(ReviewReason::Conflict.as_str())
+        );
+        assert!(!store.get_entry(&selector).expect("existing entry").locked);
+
+        let reviews = store
+            .review_list(Some(ReviewState::Pending))
+            .expect("pending reviews");
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0].proposed_entry.locked);
+        assert_eq!(
+            reviews[0].existing_entry.as_ref().map(|entry| entry.locked),
+            Some(false)
+        );
     }
 
     fn ts(value: &str) -> DateTime<Utc> {
@@ -2444,18 +3490,37 @@ mod tests {
         assert_eq!(mode.to_lowercase(), "wal");
         let strict_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_list WHERE strict = 1 AND name IN ('packs','entries','revisions','runs','commits','review_items')",
+                "SELECT COUNT(*) FROM pragma_table_list WHERE strict = 1 AND name IN ('packs','entries','revisions','runs','commits','review_items','review_policy')",
                 [],
                 |row| row.get(0),
             )
             .expect("strict count");
-        assert_eq!(strict_count, 6);
+        assert_eq!(strict_count, 7);
+        assert_eq!(
+            current_schema_version(&conn).expect("schema version"),
+            LATEST_SCHEMA_VERSION
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn health_reports_the_requested_component_version() {
+        let store = ContextStore::open_in_memory().expect("store");
+        let report = store
+            .health_with_component_version("contextd-test-version")
+            .expect("health");
+
+        assert_eq!(
+            report.component_version.as_deref(),
+            Some("contextd-test-version")
+        );
+        assert_eq!(report.api_version, Some(CONTEXT_API_VERSION));
+        assert_eq!(report.schema_version, LATEST_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2788,6 +3853,160 @@ mod tests {
             })
             .expect("reject review");
         assert_eq!(rejected.state, ReviewState::Rejected);
+    }
+
+    #[test]
+    fn review_edit_and_approve_applies_atomically() {
+        let store = temp_store();
+        let original =
+            pending_global_review(&store, "req-atomic-review", "atomic", "original body");
+
+        let approved = store
+            .review_edit_and_approve(ReviewEditAndApproveRequest {
+                review_id: original.id.clone(),
+                title: Some("Approved title".to_string()),
+                kind: Some("decision".to_string()),
+                value: Some(EntryValue::Markdown {
+                    body: "approved body".to_string(),
+                }),
+                tags: Some(vec!["approved".to_string()]),
+                metadata: Some(json!({"approved": true})),
+                locked: Some(true),
+                actor: "reviewer".to_string(),
+                note: Some("edited and approved".to_string()),
+            })
+            .expect("atomic edit and approve");
+
+        assert_eq!(approved.state, ReviewState::Approved);
+        assert_eq!(approved.revision_no, original.revision_no + 1);
+        assert_eq!(
+            approved.proposed_entry.title.as_deref(),
+            Some("Approved title")
+        );
+        assert_eq!(approved.proposed_entry.kind, "decision");
+        assert_eq!(
+            approved.proposed_entry.value.render_markdown(),
+            "approved body"
+        );
+        assert_eq!(approved.proposed_entry.tags, vec!["approved"]);
+        assert_eq!(approved.proposed_entry.metadata, json!({"approved": true}));
+        assert!(approved.proposed_entry.locked);
+        assert_eq!(
+            approved.resolution_note.as_deref(),
+            Some("edited and approved")
+        );
+
+        let entry = store
+            .get_entry(&EntrySelector {
+                scope: ScopeRef::global(),
+                pack_name: "main".to_string(),
+                entry_key: "atomic".to_string(),
+            })
+            .expect("approved entry");
+        assert_eq!(entry.title, approved.proposed_entry.title);
+        assert_eq!(entry.kind, approved.proposed_entry.kind);
+        assert_eq!(entry.value, approved.proposed_entry.value);
+        assert_eq!(entry.tags, approved.proposed_entry.tags);
+        assert_eq!(entry.metadata, approved.proposed_entry.metadata);
+        assert_eq!(entry.locked, approved.proposed_entry.locked);
+    }
+
+    #[test]
+    fn review_edit_and_approve_validation_failure_changes_nothing() {
+        let store = temp_store();
+        let original =
+            pending_global_review(&store, "req-atomic-invalid", "invalid", "original body");
+
+        let err = store
+            .review_edit_and_approve(ReviewEditAndApproveRequest {
+                review_id: original.id.clone(),
+                title: Some("must not persist".to_string()),
+                kind: Some(" ".to_string()),
+                value: None,
+                tags: None,
+                metadata: None,
+                locked: None,
+                actor: "reviewer".to_string(),
+                note: Some("invalid edit".to_string()),
+            })
+            .expect_err("invalid atomic edit");
+        assert!(matches!(err, ContextError::Validation(_)));
+        assert_eq!(find_review(&store, &original.id), original);
+        assert_eq!(store.stats().expect("stats").entries, 0);
+    }
+
+    #[test]
+    fn review_edit_and_approve_rejects_secret_note_without_partial_writes() {
+        let store = temp_store();
+        let original =
+            pending_global_review(&store, "req-atomic-secret", "secret", "original body");
+
+        let err = store
+            .review_edit_and_approve(ReviewEditAndApproveRequest {
+                review_id: original.id.clone(),
+                title: Some("must roll back".to_string()),
+                kind: None,
+                value: Some(EntryValue::Markdown {
+                    body: "safe approved body".to_string(),
+                }),
+                tags: None,
+                metadata: None,
+                locked: None,
+                actor: "reviewer".to_string(),
+                note: Some(synthetic_secret("token = sk-")),
+            })
+            .expect_err("secret resolution note");
+        assert!(matches!(err, ContextError::SecretDetected(_)));
+        assert_eq!(find_review(&store, &original.id), original);
+        assert_eq!(store.stats().expect("stats").entries, 0);
+    }
+
+    #[test]
+    fn review_edit_and_approve_rolls_back_late_database_failure() {
+        let store = temp_store();
+        let original =
+            pending_global_review(&store, "req-atomic-rollback", "rollback", "original body");
+        {
+            let conn = store.lock_conn().expect("connection");
+            conn.execute_batch(
+                "CREATE TRIGGER fail_atomic_review_approval
+                 BEFORE UPDATE OF state ON review_items
+                 WHEN NEW.state = 'approved'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced atomic approval failure');
+                 END;",
+            )
+            .expect("failure trigger");
+        }
+
+        let err = store
+            .review_edit_and_approve(ReviewEditAndApproveRequest {
+                review_id: original.id.clone(),
+                title: Some("must roll back".to_string()),
+                kind: None,
+                value: Some(EntryValue::Markdown {
+                    body: "must roll back".to_string(),
+                }),
+                tags: None,
+                metadata: None,
+                locked: Some(true),
+                actor: "reviewer".to_string(),
+                note: Some("valid note".to_string()),
+            })
+            .expect_err("forced late failure");
+        assert!(matches!(err, ContextError::Sql(_)));
+        assert_eq!(find_review(&store, &original.id), original);
+        assert_eq!(store.stats().expect("stats").entries, 0);
+
+        let conn = store.lock_conn().expect("connection");
+        let entry_revisions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM revisions WHERE entity_type = 'entry'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("entry revision count");
+        assert_eq!(entry_revisions, 0);
     }
 
     #[test]
@@ -3685,5 +4904,1234 @@ mod tests {
         assert_eq!(commit.status, CommitStatus::Rejected);
         assert_eq!(commit.items.len(), 1);
         assert_eq!(commit.items[0].disposition, CommitDisposition::Rejected);
+    }
+
+    #[test]
+    fn migrates_v4_databases_and_defaults_review_policy_to_balanced() {
+        let mut conn = Connection::open_in_memory().expect("connection");
+        ContextStore::configure_connection(&mut conn).expect("configure");
+        conn.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL) STRICT",
+            [],
+        )
+        .expect("migration table");
+        for version in 1..=4 {
+            let tx = conn.transaction().expect("transaction");
+            match version {
+                1 => migration_v1(&tx).expect("v1"),
+                2 => migration_v2(&tx).expect("v2"),
+                3 => migration_v3(&tx).expect("v3"),
+                4 => migration_v4(&tx).expect("v4"),
+                _ => unreachable!(),
+            }
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                params![version, now_utc().to_rfc3339()],
+            )
+            .expect("record migration");
+            tx.commit().expect("commit migration");
+        }
+        assert_eq!(current_schema_version(&conn).expect("version"), 4);
+        conn.execute(
+            "INSERT INTO revisions (id, entity_type, entity_id, revision_no, action, snapshot_json, provenance_json, commit_request_id, run_id, created_at) VALUES ('rev-v4', 'entry', 'entry-v4', 1, 'create', '{}', '{}', NULL, NULL, ?)",
+            params![now_utc().to_rfc3339()],
+        )
+        .expect("seed revision");
+        conn.execute(
+            "INSERT INTO review_items (id, request_id, scope_kind, scope_id, pack_name, entry_key, state, reason, proposed_entry_json, existing_entry_json, resolution_note, created_at, updated_at, current_revision_no) VALUES ('review-v4', 'request-v4', 'project', 'proj', 'main', 'key', 'pending', 'locked', '{}', NULL, NULL, ?, ?, 0)",
+            params![now_utc().to_rfc3339(), now_utc().to_rfc3339()],
+        )
+        .expect("seed review");
+
+        ContextStore::migrate(&mut conn).expect("migrate to latest");
+        assert_eq!(
+            current_schema_version(&conn).expect("latest version"),
+            LATEST_SCHEMA_VERSION
+        );
+        let policy = get_review_policy_tx(&conn).expect("policy");
+        assert_eq!(policy.mode, ReviewMode::Balanced);
+        assert_eq!(policy.revision_no, 1);
+        let preserved_revision: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM revisions WHERE id = 'rev-v4' AND entity_type = 'entry'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved revision");
+        let preserved_review: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_items WHERE id = 'review-v4' AND reason = 'locked'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved review");
+        assert_eq!(preserved_revision, 1);
+        assert_eq!(preserved_review, 1);
+    }
+
+    #[test]
+    fn review_policy_is_persisted_audited_and_secret_checked() {
+        let store = temp_store();
+        let default_policy = store.get_review_policy().expect("default policy");
+        assert_eq!(default_policy.mode, ReviewMode::Balanced);
+
+        let updated = store
+            .set_review_policy(SetReviewPolicyRequest {
+                mode: ReviewMode::Fast,
+                metadata: json!({"reason": "interactive workflow"}),
+                actor: "admin".to_string(),
+            })
+            .expect("set policy");
+        assert_eq!(updated.mode, ReviewMode::Fast);
+        assert_eq!(updated.revision_no, default_policy.revision_no + 1);
+        assert_eq!(store.get_review_policy().expect("persisted"), updated);
+
+        let unchanged = store
+            .set_review_policy(SetReviewPolicyRequest {
+                mode: ReviewMode::Fast,
+                metadata: json!({"reason": "interactive workflow"}),
+                actor: "another-admin".to_string(),
+            })
+            .expect("idempotent set");
+        assert_eq!(unchanged.revision_no, updated.revision_no);
+
+        let secret_err = store
+            .set_review_policy(SetReviewPolicyRequest {
+                mode: ReviewMode::Strict,
+                metadata: json!({"credential": synthetic_secret("sk-")}),
+                actor: "admin".to_string(),
+            })
+            .expect_err("secret metadata");
+        assert!(matches!(secret_err, ContextError::SecretDetected(_)));
+        let actor_err = store
+            .set_review_policy(SetReviewPolicyRequest {
+                mode: ReviewMode::Strict,
+                metadata: json!({}),
+                actor: synthetic_secret("xoxb-1234567890-"),
+            })
+            .expect_err("secret actor");
+        assert!(matches!(actor_err, ContextError::SecretDetected(_)));
+        assert_eq!(
+            store.get_review_policy().expect("policy unchanged").mode,
+            ReviewMode::Fast
+        );
+
+        let conn = store.lock_conn().expect("conn");
+        let (revision_count, source): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), (SELECT json_extract(provenance_json, '$.source') FROM revisions WHERE entity_type = 'policy' AND entity_id = 'review' ORDER BY revision_no DESC LIMIT 1) FROM revisions WHERE entity_type = 'policy' AND entity_id = 'review'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("policy revisions");
+        assert_eq!(revision_count, 2);
+        assert_eq!(source, "review_policy_update");
+    }
+
+    #[test]
+    fn review_modes_enforce_strict_balanced_and_fast_semantics() {
+        let project = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+
+        let strict = temp_store();
+        strict
+            .set_review_policy(SetReviewPolicyRequest {
+                mode: ReviewMode::Strict,
+                metadata: json!({}),
+                actor: "admin".to_string(),
+            })
+            .expect("strict policy");
+        let strict_result = strict
+            .commit_work(CommitWorkRequest {
+                request_id: "strict-new".to_string(),
+                actor: "agent".to_string(),
+                run: None,
+                proposals: vec![CommitProposal {
+                    scope: project.clone(),
+                    pack_name: "main".to_string(),
+                    entry: sample_entry("new", "strict review"),
+                }],
+            })
+            .expect("strict commit");
+        assert_eq!(
+            strict_result.items[0].disposition,
+            CommitDisposition::Pending
+        );
+        assert_eq!(
+            strict_result.items[0].reason.as_deref(),
+            Some(ReviewReason::StrictPolicy.as_str())
+        );
+        let duplicate_entry = sample_entry("duplicate", "same");
+        strict
+            .put_entry(PutEntryRequest {
+                scope: project.clone(),
+                pack_name: "main".to_string(),
+                entry: duplicate_entry.clone(),
+                actor: "tester".to_string(),
+            })
+            .expect("seed duplicate");
+        let strict_duplicate = strict
+            .commit_work(CommitWorkRequest {
+                request_id: "strict-duplicate".to_string(),
+                actor: "agent".to_string(),
+                run: None,
+                proposals: vec![CommitProposal {
+                    scope: project.clone(),
+                    pack_name: "main".to_string(),
+                    entry: duplicate_entry,
+                }],
+            })
+            .expect("strict duplicate");
+        assert_eq!(
+            strict_duplicate.items[0].disposition,
+            CommitDisposition::Duplicate
+        );
+
+        let balanced = temp_store();
+        balanced
+            .put_entry(PutEntryRequest {
+                scope: project.clone(),
+                pack_name: "main".to_string(),
+                entry: sample_entry("conflict", "old"),
+                actor: "tester".to_string(),
+            })
+            .expect("seed balanced conflict");
+        let balanced_result = balanced
+            .commit_work(CommitWorkRequest {
+                request_id: "balanced".to_string(),
+                actor: "agent".to_string(),
+                run: None,
+                proposals: vec![
+                    CommitProposal {
+                        scope: project.clone(),
+                        pack_name: "main".to_string(),
+                        entry: sample_entry("safe", "direct"),
+                    },
+                    CommitProposal {
+                        scope: project.clone(),
+                        pack_name: "main".to_string(),
+                        entry: sample_entry("conflict", "changed"),
+                    },
+                ],
+            })
+            .expect("balanced commit");
+        assert_eq!(
+            balanced_result.items[0].disposition,
+            CommitDisposition::Applied
+        );
+        assert_eq!(
+            balanced_result.items[1].disposition,
+            CommitDisposition::Pending
+        );
+
+        let fast = temp_store();
+        fast.set_review_policy(SetReviewPolicyRequest {
+            mode: ReviewMode::Fast,
+            metadata: json!({}),
+            actor: "admin".to_string(),
+        })
+        .expect("fast policy");
+        fast.put_entry(PutEntryRequest {
+            scope: project.clone(),
+            pack_name: "main".to_string(),
+            entry: sample_entry("conflict", "old"),
+            actor: "tester".to_string(),
+        })
+        .expect("seed fast conflict");
+        fast.put_entry(PutEntryRequest {
+            scope: project.clone(),
+            pack_name: "main".to_string(),
+            entry: EntryInput {
+                locked: true,
+                ..sample_entry("locked", "old")
+            },
+            actor: "tester".to_string(),
+        })
+        .expect("seed locked");
+        let fast_result = fast
+            .commit_work(CommitWorkRequest {
+                request_id: "fast".to_string(),
+                actor: "agent".to_string(),
+                run: None,
+                proposals: vec![
+                    CommitProposal {
+                        scope: project.clone(),
+                        pack_name: "main".to_string(),
+                        entry: sample_entry("conflict", "changed"),
+                    },
+                    CommitProposal {
+                        scope: project.clone(),
+                        pack_name: "main".to_string(),
+                        entry: sample_entry("locked", "changed"),
+                    },
+                    CommitProposal {
+                        scope: ScopeRef::global(),
+                        pack_name: "main".to_string(),
+                        entry: sample_entry("global", "review"),
+                    },
+                    CommitProposal {
+                        scope: project,
+                        pack_name: "main".to_string(),
+                        entry: sample_entry("secret", &synthetic_secret("token = sk-")),
+                    },
+                ],
+            })
+            .expect("fast commit");
+        assert_eq!(fast_result.items[0].disposition, CommitDisposition::Applied);
+        assert_eq!(fast_result.items[1].disposition, CommitDisposition::Pending);
+        assert_eq!(fast_result.items[2].disposition, CommitDisposition::Pending);
+        assert_eq!(
+            fast_result.items[3].disposition,
+            CommitDisposition::Rejected
+        );
+        assert_eq!(
+            fast.get_entry(&EntrySelector {
+                scope: ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope"),
+                pack_name: "main".to_string(),
+                entry_key: "conflict".to_string(),
+            })
+            .expect("updated conflict")
+            .value
+            .render_markdown(),
+            "changed"
+        );
+    }
+
+    #[test]
+    fn source_import_candidate_equality_matches_preview_semantics() {
+        let store = temp_store();
+        let scope = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let mut candidate = sample_entry("candidate", "exact body");
+        candidate.title = Some("Exact title".to_string());
+        candidate.kind = "instructions".to_string();
+        candidate.tags = vec!["alpha".to_string(), "beta".to_string()];
+        candidate.metadata = json!({"nested": {"enabled": true}});
+        candidate.locked = true;
+        candidate.provenance = Some(Provenance {
+            actor: "importer".to_string(),
+            source: "source_import:ucm_json".to_string(),
+            source_ref: Some("bundle.json#candidate".to_string()),
+            run_id: None,
+            request_id: None,
+            note: Some("imported".to_string()),
+        });
+        let record = store
+            .put_entry(PutEntryRequest {
+                scope,
+                pack_name: "main".to_string(),
+                entry: candidate.clone(),
+                actor: "seed".to_string(),
+            })
+            .expect("stored candidate");
+        assert!(entry_record_matches_input(&record, &candidate));
+
+        let mut changed = candidate.clone();
+        changed.title = Some("Changed title".to_string());
+        assert!(!entry_record_matches_input(&record, &changed));
+
+        let mut changed = candidate.clone();
+        changed.kind = "decision".to_string();
+        assert!(!entry_record_matches_input(&record, &changed));
+
+        let mut changed = candidate.clone();
+        changed.value = EntryValue::Markdown {
+            body: "exact body\n".to_string(),
+        };
+        assert!(!entry_record_matches_input(&record, &changed));
+
+        let mut changed = candidate.clone();
+        changed.tags.reverse();
+        assert!(!entry_record_matches_input(&record, &changed));
+
+        let mut changed = candidate.clone();
+        changed.metadata = json!({"nested": {"enabled": false}});
+        assert!(!entry_record_matches_input(&record, &changed));
+
+        let mut changed = candidate.clone();
+        changed.locked = false;
+        assert!(!entry_record_matches_input(&record, &changed));
+
+        let mut provenance_only = candidate;
+        provenance_only.provenance = Some(Provenance::system("other-importer", "retry"));
+        assert!(entry_record_matches_input(&record, &provenance_only));
+    }
+
+    #[test]
+    fn strict_source_import_reviews_lock_only_conflicts() {
+        assert_lock_only_source_import_is_reviewed(ReviewMode::Strict);
+    }
+
+    #[test]
+    fn balanced_source_import_reviews_lock_only_conflicts() {
+        assert_lock_only_source_import_is_reviewed(ReviewMode::Balanced);
+    }
+
+    #[test]
+    fn fast_source_import_applies_lock_only_conflicts() {
+        let store = temp_store();
+        set_review_mode(&store, ReviewMode::Fast);
+        let request = locked_source_import_request(
+            ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope"),
+        );
+        let (selector, preview) = seed_unlocked_source_import_candidate(&store, &request);
+        assert_eq!(preview.review_mode, ReviewMode::Fast);
+
+        let result = store.apply_source_import(request).expect("apply import");
+        assert_eq!(result.applied_count, 1);
+        assert_eq!(result.pending_count, 0);
+        assert_eq!(result.items[0].disposition, CommitDisposition::Applied);
+        assert!(store.get_entry(&selector).expect("updated entry").locked);
+        assert!(
+            store
+                .review_list(Some(ReviewState::Pending))
+                .expect("pending reviews")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_import_preview_fingerprint_uses_canonical_full_state() {
+        let candidate = SourceImportCandidate {
+            candidate_index: 0,
+            document_index: 0,
+            source_path: Some("AGENTS.md".to_string()),
+            detected_source_kind: SourceImportKind::AgentsMd,
+            entry: sample_entry("agents-instructions", "body"),
+            disposition: SourceImportDisposition::New,
+            existing_entry_id: None,
+            existing_revision_no: None,
+            warnings: vec!["candidate warning".to_string()],
+        };
+        let left = SourceImportPreview {
+            destination: ScopeRef::normalized(ScopeKind::Project, "a").expect("scope"),
+            pack_name: "b::c".to_string(),
+            review_mode: ReviewMode::Balanced,
+            destination_pack: SourceImportPackGovernance::default(),
+            preview_fingerprint: None,
+            candidates: vec![candidate],
+            warnings: vec!["preview warning".to_string()],
+            apply_allowed: true,
+        };
+        let right = SourceImportPreview {
+            destination: ScopeRef::normalized(ScopeKind::Project, "a::b").expect("scope"),
+            pack_name: "c".to_string(),
+            ..left.clone()
+        };
+        let left_fingerprint =
+            source_import_preview_fingerprint("actor", &left).expect("left fingerprint");
+        assert_ne!(
+            left_fingerprint,
+            source_import_preview_fingerprint("actor", &right).expect("right fingerprint")
+        );
+        assert_ne!(
+            left_fingerprint,
+            source_import_preview_fingerprint("other-actor", &left).expect("actor fingerprint")
+        );
+
+        let mut changed = left.clone();
+        changed.review_mode = ReviewMode::Fast;
+        assert_ne!(
+            left_fingerprint,
+            source_import_preview_fingerprint("actor", &changed).expect("mode fingerprint")
+        );
+
+        let mut changed = left.clone();
+        changed.destination_pack = SourceImportPackGovernance {
+            exists: true,
+            status: Some(PackStatus::Active),
+            locked: true,
+            lock_reason: Some("hold".to_string()),
+            revision_no: Some(3),
+        };
+        assert_ne!(
+            left_fingerprint,
+            source_import_preview_fingerprint("actor", &changed).expect("pack fingerprint")
+        );
+
+        let mut changed = left.clone();
+        changed.candidates[0].entry.locked = true;
+        changed.candidates[0].disposition = SourceImportDisposition::Conflict;
+        changed.candidates[0].existing_entry_id = Some("entry-1".to_string());
+        changed.candidates[0].existing_revision_no = Some(7);
+        changed.candidates[0]
+            .warnings
+            .push("state changed".to_string());
+        assert_ne!(
+            left_fingerprint,
+            source_import_preview_fingerprint("actor", &changed).expect("candidate fingerprint")
+        );
+    }
+
+    #[test]
+    fn source_import_expected_fingerprint_rejects_destination_state_change() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let mut request =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nPreviewed.");
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("preview");
+        let candidate_key = preview.candidates[0].entry.key.clone();
+        request.expected_preview_fingerprint = preview.preview_fingerprint;
+
+        store
+            .put_entry(PutEntryRequest {
+                scope: destination.clone(),
+                pack_name: "instructions".to_string(),
+                entry: sample_entry(&candidate_key, "concurrent destination content"),
+                actor: "other-actor".to_string(),
+            })
+            .expect("concurrent write");
+
+        let err = store
+            .apply_source_import(request)
+            .expect_err("stale preview must fail");
+        assert!(matches!(err, ContextError::Conflict(_)));
+        assert_eq!(
+            store
+                .get_entry(&EntrySelector {
+                    scope: destination,
+                    pack_name: "instructions".to_string(),
+                    entry_key: candidate_key,
+                })
+                .expect("concurrent entry")
+                .value
+                .render_markdown(),
+            "concurrent destination content"
+        );
+    }
+
+    #[test]
+    fn source_import_expected_fingerprint_rejects_review_mode_change() {
+        let store = temp_store();
+        let mut request = instruction_source_import_request(
+            ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope"),
+            "# Rules\n\nPreviewed.",
+        );
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("preview");
+        request.expected_preview_fingerprint = preview.preview_fingerprint;
+        set_review_mode(&store, ReviewMode::Strict);
+
+        let err = store
+            .apply_source_import(request)
+            .expect_err("review mode change must fail");
+        assert!(matches!(err, ContextError::Conflict(_)));
+        assert_eq!(store.stats().expect("stats").entries, 0);
+    }
+
+    #[test]
+    fn source_import_reapplies_after_imported_entry_is_deleted() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let request = instruction_source_import_request(
+            destination.clone(),
+            "# Rules\n\nRestore this import.",
+        );
+
+        let first = store
+            .apply_source_import(request.clone())
+            .expect("first apply");
+        assert_eq!(first.applied_count, 1);
+        let selector = EntrySelector {
+            scope: destination,
+            pack_name: "instructions".to_string(),
+            entry_key: "agents-instructions".to_string(),
+        };
+        let deleted = store
+            .delete_entry(DeleteEntryRequest {
+                selector: selector.clone(),
+                actor: "operator".to_string(),
+            })
+            .expect("delete imported entry");
+        assert_eq!(deleted.status, EntryStatus::Deleted);
+
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("reapply preview");
+        assert_eq!(
+            preview.candidates[0].disposition,
+            SourceImportDisposition::New
+        );
+        let second = store
+            .apply_source_import(request)
+            .expect("reapply deleted entry");
+        assert_eq!(second.applied_count, 1);
+        assert_ne!(second.request_id, first.request_id);
+        let restored = store.get_entry(&selector).expect("restored entry");
+        assert_eq!(restored.status, EntryStatus::Active);
+        assert_eq!(
+            restored.value.render_markdown(),
+            "# Rules\n\nRestore this import."
+        );
+    }
+
+    #[test]
+    fn source_import_policy_change_does_not_replay_cached_pending_result() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let request =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nDesired content.");
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("preview");
+        let candidate_key = preview.candidates[0].entry.key.clone();
+        store
+            .put_entry(PutEntryRequest {
+                scope: destination.clone(),
+                pack_name: "instructions".to_string(),
+                entry: sample_entry(&candidate_key, "existing content"),
+                actor: "seed".to_string(),
+            })
+            .expect("seed conflict");
+
+        let balanced = store
+            .apply_source_import(request.clone())
+            .expect("balanced apply");
+        assert_eq!(balanced.pending_count, 1);
+        set_review_mode(&store, ReviewMode::Fast);
+        let fast = store.apply_source_import(request).expect("fast reapply");
+        assert_eq!(fast.applied_count, 1);
+        assert_ne!(fast.request_id, balanced.request_id);
+        assert_eq!(
+            store
+                .get_entry(&EntrySelector {
+                    scope: destination,
+                    pack_name: "instructions".to_string(),
+                    entry_key: candidate_key,
+                })
+                .expect("updated entry")
+                .value
+                .render_markdown(),
+            "# Rules\n\nDesired content."
+        );
+    }
+
+    #[test]
+    fn source_import_entry_revision_change_does_not_replay_cached_applied_result() {
+        let store = temp_store();
+        set_review_mode(&store, ReviewMode::Fast);
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let request =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nDesired content.");
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("preview");
+        let candidate_key = preview.candidates[0].entry.key.clone();
+        store
+            .put_entry(PutEntryRequest {
+                scope: destination.clone(),
+                pack_name: "instructions".to_string(),
+                entry: sample_entry(&candidate_key, "first conflict"),
+                actor: "seed".to_string(),
+            })
+            .expect("seed conflict");
+
+        let first = store
+            .apply_source_import(request.clone())
+            .expect("first fast apply");
+        assert_eq!(first.applied_count, 1);
+        store
+            .put_entry(PutEntryRequest {
+                scope: destination.clone(),
+                pack_name: "instructions".to_string(),
+                entry: sample_entry(&candidate_key, "later concurrent content"),
+                actor: "other-writer".to_string(),
+            })
+            .expect("later write");
+
+        let second = store
+            .apply_source_import(request)
+            .expect("reapply after revision change");
+        assert_eq!(second.applied_count, 1);
+        assert_ne!(second.request_id, first.request_id);
+        assert_eq!(
+            store
+                .get_entry(&EntrySelector {
+                    scope: destination,
+                    pack_name: "instructions".to_string(),
+                    entry_key: candidate_key,
+                })
+                .expect("restored desired entry")
+                .value
+                .render_markdown(),
+            "# Rules\n\nDesired content."
+        );
+    }
+
+    #[test]
+    fn source_import_stable_pending_retry_does_not_duplicate_review() {
+        let store = temp_store();
+        let request = instruction_source_import_request(
+            ScopeRef::global(),
+            "# Rules\n\nNeeds global review.",
+        );
+
+        let first = store
+            .apply_source_import(request.clone())
+            .expect("first pending apply");
+        assert_eq!(first.pending_count, 1);
+        let second = store.apply_source_import(request).expect("stable retry");
+        assert_eq!(second.pending_count, 1);
+        assert_eq!(
+            second.items[0].review_id.as_deref(),
+            first.items[0].review_id.as_deref()
+        );
+        assert_eq!(
+            store
+                .review_list(Some(ReviewState::Pending))
+                .expect("pending reviews")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn source_import_pack_lock_invalidates_preview_and_routes_to_review() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let created = create_import_pack(&store, destination.clone());
+        let mut request =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nLocked import.");
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("unlocked preview");
+        assert_eq!(
+            preview.destination_pack,
+            SourceImportPackGovernance {
+                exists: true,
+                status: Some(PackStatus::Active),
+                locked: false,
+                lock_reason: None,
+                revision_no: Some(created.revision_no),
+            }
+        );
+        request.expected_preview_fingerprint = preview.preview_fingerprint;
+
+        let locked = store
+            .update_pack(UpdatePackRequest {
+                selector: PackSelector {
+                    scope: destination.clone(),
+                    name: "instructions".to_string(),
+                },
+                description: None,
+                metadata: None,
+                status: None,
+                locked: Some(true),
+                lock_reason: Some("operator hold".to_string()),
+                actor: "pack-owner".to_string(),
+            })
+            .expect("lock destination pack");
+        let err = store
+            .apply_source_import(request.clone())
+            .expect_err("stale unlocked preview");
+        assert!(matches!(err, ContextError::Conflict(_)));
+
+        let fresh = store
+            .preview_source_import((&request).into())
+            .expect("locked preview");
+        assert_eq!(
+            fresh.destination_pack,
+            SourceImportPackGovernance {
+                exists: true,
+                status: Some(PackStatus::Active),
+                locked: true,
+                lock_reason: Some("operator hold".to_string()),
+                revision_no: Some(locked.revision_no),
+            }
+        );
+        assert!(fresh.apply_allowed);
+        assert!(
+            fresh
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("locked"))
+        );
+        request.expected_preview_fingerprint = fresh.preview_fingerprint;
+        let result = store
+            .apply_source_import(request)
+            .expect("locked pack apply");
+        assert_eq!(result.pending_count, 1);
+        assert_eq!(
+            result.items[0].reason.as_deref(),
+            Some(ReviewReason::Locked.as_str())
+        );
+        assert_eq!(store.stats().expect("stats").entries, 0);
+    }
+
+    #[test]
+    fn source_import_pack_archive_invalidates_and_blocks_preview() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        create_import_pack(&store, destination.clone());
+        let mut request =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nArchived import.");
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("active preview");
+        request.expected_preview_fingerprint = preview.preview_fingerprint;
+
+        let archived = store
+            .update_pack(UpdatePackRequest {
+                selector: PackSelector {
+                    scope: destination,
+                    name: "instructions".to_string(),
+                },
+                description: None,
+                metadata: None,
+                status: Some(PackStatus::Archived),
+                locked: None,
+                lock_reason: None,
+                actor: "pack-owner".to_string(),
+            })
+            .expect("archive destination pack");
+        let err = store
+            .apply_source_import(request.clone())
+            .expect_err("stale active preview");
+        assert!(matches!(err, ContextError::Conflict(_)));
+
+        let fresh = store
+            .preview_source_import((&request).into())
+            .expect("archived preview");
+        assert_eq!(
+            fresh.destination_pack,
+            SourceImportPackGovernance {
+                exists: true,
+                status: Some(PackStatus::Archived),
+                locked: false,
+                lock_reason: None,
+                revision_no: Some(archived.revision_no),
+            }
+        );
+        assert!(!fresh.apply_allowed);
+        assert!(
+            fresh
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("archived"))
+        );
+        request.expected_preview_fingerprint = fresh.preview_fingerprint;
+        let err = store
+            .apply_source_import(request)
+            .expect_err("archived pack must block apply");
+        assert!(matches!(err, ContextError::Validation(_)));
+        assert_eq!(store.stats().expect("stats").entries, 0);
+    }
+
+    #[test]
+    fn stale_fast_preview_cannot_overwrite_concurrent_import() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("concurrent-source-import.db");
+        let setup = ContextStore::open(&db_path).expect("setup store");
+        set_review_mode(&setup, ReviewMode::Fast);
+        drop(setup);
+
+        let store_a = ContextStore::open(&db_path).expect("store a");
+        let store_b = ContextStore::open(&db_path).expect("store b");
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let mut request_a =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nFirst writer.");
+        let mut request_b =
+            instruction_source_import_request(destination.clone(), "# Rules\n\nSecond writer.");
+        let preview_a = store_a
+            .preview_source_import((&request_a).into())
+            .expect("preview a");
+        let preview_b = store_b
+            .preview_source_import((&request_b).into())
+            .expect("preview b");
+        let candidate_key = preview_a.candidates[0].entry.key.clone();
+        request_a.expected_preview_fingerprint = preview_a.preview_fingerprint;
+        request_b.expected_preview_fingerprint = preview_b.preview_fingerprint;
+
+        let (first_done_tx, first_done_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            let result = store_a.apply_source_import(request_a);
+            first_done_tx.send(()).expect("signal first completion");
+            result
+        });
+        let second = std::thread::spawn(move || {
+            first_done_rx.recv().expect("wait for first import");
+            store_b.apply_source_import(request_b)
+        });
+
+        assert_eq!(
+            first
+                .join()
+                .expect("first thread")
+                .expect("first apply")
+                .applied_count,
+            1
+        );
+        let second_error = second
+            .join()
+            .expect("second thread")
+            .expect_err("stale second apply");
+        assert!(matches!(second_error, ContextError::Conflict(_)));
+
+        let verifier = ContextStore::open(&db_path).expect("verifier");
+        assert_eq!(
+            verifier
+                .get_entry(&EntrySelector {
+                    scope: destination,
+                    pack_name: "instructions".to_string(),
+                    entry_key: candidate_key,
+                })
+                .expect("winning entry")
+                .value
+                .render_markdown(),
+            "# Rules\n\nFirst writer."
+        );
+    }
+
+    #[test]
+    fn source_import_apply_rolls_back_all_candidates_on_late_failure() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let mut request = SourceImportApplyRequest {
+            source_kind: SourceImportKind::Auto,
+            documents: vec![
+                SourceImportDocument {
+                    path: Some("AGENTS.md".to_string()),
+                    payload: "# Agent rules".to_string(),
+                },
+                SourceImportDocument {
+                    path: Some("CLAUDE.md".to_string()),
+                    payload: "# Claude rules".to_string(),
+                },
+            ],
+            destination,
+            pack_name: Some("instructions".to_string()),
+            actor: "importer".to_string(),
+            expected_preview_fingerprint: None,
+        };
+        let preview = store
+            .preview_source_import((&request).into())
+            .expect("preview");
+        request.expected_preview_fingerprint = preview.preview_fingerprint;
+        {
+            let conn = store.lock_conn().expect("connection");
+            conn.execute_batch(
+                "CREATE TRIGGER fail_second_source_import
+                 BEFORE INSERT ON entries
+                 WHEN NEW.entry_key = 'claude-instructions'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced source import failure');
+                 END;",
+            )
+            .expect("failure trigger");
+        }
+
+        let err = store
+            .apply_source_import(request)
+            .expect_err("late candidate failure");
+        assert!(matches!(err, ContextError::Sql(_)));
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.packs, 0);
+        assert_eq!(stats.entries, 0);
+        let conn = store.lock_conn().expect("connection");
+        let source_import_commits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commits WHERE request_id LIKE 'source-import-%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("commit count");
+        assert_eq!(source_import_commits, 0);
+    }
+
+    #[test]
+    fn source_import_preview_reports_duplicates_and_conflicts_and_apply_is_idempotent() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let request = SourceImportApplyRequest {
+            source_kind: SourceImportKind::Auto,
+            documents: vec![SourceImportDocument {
+                path: Some("AGENTS.md".to_string()),
+                payload: "# Project instructions\n\nRun focused tests.".to_string(),
+            }],
+            destination: destination.clone(),
+            pack_name: Some("instructions".to_string()),
+            actor: "importer".to_string(),
+            expected_preview_fingerprint: None,
+        };
+        let first = store
+            .apply_source_import(request.clone())
+            .expect("first apply");
+        assert_eq!(first.candidate_count, 1);
+        assert_eq!(first.imported_count, 1);
+        assert_eq!(first.applied_count, 1);
+        assert_eq!(first.pending_count, 0);
+        let entry = store
+            .get_entry(&EntrySelector {
+                scope: destination.clone(),
+                pack_name: "instructions".to_string(),
+                entry_key: "agents-instructions".to_string(),
+            })
+            .expect("imported entry");
+        assert_eq!(entry.provenance.source_ref.as_deref(), Some("AGENTS.md"));
+        let revision_no = entry.revision_no;
+
+        let duplicate_preview = store
+            .preview_source_import((&request).into())
+            .expect("duplicate preview");
+        assert_eq!(
+            duplicate_preview.candidates[0].disposition,
+            SourceImportDisposition::Duplicate
+        );
+        let second = store
+            .apply_source_import(request.clone())
+            .expect("idempotent apply");
+        assert_eq!(second.imported_count, 0);
+        assert_eq!(second.skipped_count, 1);
+        assert_eq!(second.items[0].disposition, CommitDisposition::Duplicate);
+        assert_eq!(
+            store
+                .get_entry(&EntrySelector {
+                    scope: destination.clone(),
+                    pack_name: "instructions".to_string(),
+                    entry_key: "agents-instructions".to_string(),
+                })
+                .expect("unchanged entry")
+                .revision_no,
+            revision_no
+        );
+
+        let mut changed = request;
+        changed.documents[0].payload.push_str("\nUse clippy.");
+        let conflict_preview = store
+            .preview_source_import((&changed).into())
+            .expect("conflict preview");
+        assert_eq!(
+            conflict_preview.candidates[0].disposition,
+            SourceImportDisposition::Conflict
+        );
+        assert_eq!(conflict_preview.destination, destination);
+        assert_eq!(conflict_preview.pack_name, "instructions");
+        assert!(conflict_preview.apply_allowed);
+    }
+
+    #[test]
+    fn mixed_source_import_retries_do_not_duplicate_pending_reviews() {
+        let store = temp_store();
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        store
+            .put_entry(PutEntryRequest {
+                scope: destination.clone(),
+                pack_name: "main".to_string(),
+                entry: sample_entry("claude-instructions", "existing"),
+                actor: "tester".to_string(),
+            })
+            .expect("seed conflict");
+        let request = SourceImportApplyRequest {
+            source_kind: SourceImportKind::Auto,
+            documents: vec![
+                SourceImportDocument {
+                    path: Some("AGENTS.md".to_string()),
+                    payload: "# Agent instructions".to_string(),
+                },
+                SourceImportDocument {
+                    path: Some("CLAUDE.md".to_string()),
+                    payload: "# Claude instructions".to_string(),
+                },
+            ],
+            destination,
+            pack_name: None,
+            actor: "importer".to_string(),
+            expected_preview_fingerprint: None,
+        };
+
+        let first = store
+            .apply_source_import(request.clone())
+            .expect("first apply");
+        assert_eq!(first.applied_count, 1);
+        assert_eq!(first.pending_count, 1);
+        assert_eq!(store.review_list(None).expect("reviews").len(), 1);
+
+        let retry = store.apply_source_import(request).expect("retry");
+        assert_eq!(retry.applied_count, 0);
+        assert_eq!(retry.pending_count, 1);
+        assert_eq!(retry.skipped_count, 1);
+        assert_eq!(store.review_list(None).expect("reviews").len(), 1);
+    }
+
+    #[test]
+    fn staged_source_import_accepts_ucm_json_and_markdown_exports() {
+        let source = temp_store();
+        source
+            .put_entry(PutEntryRequest {
+                scope: ScopeRef::global(),
+                pack_name: "main".to_string(),
+                entry: sample_entry("exported", "portable instructions"),
+                actor: "tester".to_string(),
+            })
+            .expect("seed export");
+        let export_request = ExportRequest {
+            project_scope_id: None,
+            task_scope_id: None,
+            scope: None,
+            pack_name: None,
+            include_deleted: false,
+            include_reviews: false,
+            include_runs: false,
+        };
+        let json_payload = source
+            .export_json(export_request.clone())
+            .expect("json export");
+        let markdown_payload = source
+            .export_markdown(export_request)
+            .expect("markdown export");
+        let destination = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        let target = temp_store();
+
+        for (source_kind, payload, path, pack_name) in [
+            (
+                SourceImportKind::UcmJson,
+                json_payload,
+                "ucm-export.json",
+                "json-import",
+            ),
+            (
+                SourceImportKind::UcmMarkdown,
+                markdown_payload,
+                "ucm-export.md",
+                "markdown-import",
+            ),
+        ] {
+            let request = SourceImportApplyRequest {
+                source_kind,
+                documents: vec![SourceImportDocument {
+                    path: Some(path.to_string()),
+                    payload,
+                }],
+                destination: destination.clone(),
+                pack_name: Some(pack_name.to_string()),
+                actor: "importer".to_string(),
+                expected_preview_fingerprint: None,
+            };
+            let preview = target
+                .preview_source_import((&request).into())
+                .expect("preview");
+            assert_eq!(preview.candidates.len(), 1);
+            assert_eq!(preview.candidates[0].detected_source_kind, source_kind);
+            assert_eq!(preview.candidates[0].entry.key, "exported");
+            let applied = target.apply_source_import(request).expect("apply");
+            assert_eq!(applied.applied_count, 1);
+            assert_eq!(
+                target
+                    .get_entry(&EntrySelector {
+                        scope: destination.clone(),
+                        pack_name: pack_name.to_string(),
+                        entry_key: "exported".to_string(),
+                    })
+                    .expect("imported entry")
+                    .value
+                    .render_markdown(),
+                "portable instructions"
+            );
+        }
+    }
+
+    #[test]
+    fn source_import_rejects_secrets_without_creating_records() {
+        let store = temp_store();
+        let err = store
+            .apply_source_import(SourceImportApplyRequest {
+                source_kind: SourceImportKind::PlainMarkdown,
+                documents: vec![SourceImportDocument {
+                    path: Some("notes.md".to_string()),
+                    payload: format!("# Notes\n\n{}", synthetic_secret("token = sk-")),
+                }],
+                destination: ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope"),
+                pack_name: None,
+                actor: "importer".to_string(),
+                expected_preview_fingerprint: None,
+            })
+            .expect_err("secret source");
+        assert!(matches!(err, ContextError::SecretDetected(_)));
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.packs, 0);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.reviews, 0);
+    }
+
+    #[test]
+    fn compose_reports_metrics_and_ordered_exclusions() {
+        let store = temp_store();
+        let scope = ScopeRef::normalized(ScopeKind::Project, "proj").expect("scope");
+        store
+            .put_entry(PutEntryRequest {
+                scope: scope.clone(),
+                pack_name: "main".to_string(),
+                entry: sample_entry("included", "visible"),
+                actor: "tester".to_string(),
+            })
+            .expect("included");
+        store
+            .put_entry(PutEntryRequest {
+                scope: scope.clone(),
+                pack_name: "main".to_string(),
+                entry: sample_entry("deleted", "hidden"),
+                actor: "tester".to_string(),
+            })
+            .expect("deleted seed");
+        store
+            .delete_entry(DeleteEntryRequest {
+                selector: EntrySelector {
+                    scope: scope.clone(),
+                    pack_name: "main".to_string(),
+                    entry_key: "deleted".to_string(),
+                },
+                actor: "tester".to_string(),
+            })
+            .expect("delete");
+        store
+            .put_entry(PutEntryRequest {
+                scope: scope.clone(),
+                pack_name: "archived".to_string(),
+                entry: sample_entry("archived", "hidden"),
+                actor: "tester".to_string(),
+            })
+            .expect("archived seed");
+        store
+            .update_pack(UpdatePackRequest {
+                selector: PackSelector {
+                    scope,
+                    name: "archived".to_string(),
+                },
+                description: None,
+                metadata: None,
+                status: Some(PackStatus::Archived),
+                locked: None,
+                lock_reason: None,
+                actor: "tester".to_string(),
+            })
+            .expect("archive");
+
+        let composed = store
+            .compose_context(ComposeRequest {
+                project_scope_id: Some("proj".to_string()),
+                task_scope_id: None,
+                include_archived: false,
+            })
+            .expect("compose");
+        assert_eq!(
+            composed.metrics.rendered_bytes,
+            composed.rendered_markdown.len()
+        );
+        assert_eq!(composed.metrics.included_entries, 1);
+        assert_eq!(composed.metrics.excluded_entries, 2);
+        assert!(composed.metrics.estimated_tokens > 0);
+        assert_eq!(composed.sections[0].entries[0].key, "included");
+        assert_eq!(
+            composed
+                .exclusions
+                .iter()
+                .map(|item| item.reason.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ComposeExclusionReason::ArchivedPack,
+                ComposeExclusionReason::DeletedEntry,
+            ]
+        );
     }
 }

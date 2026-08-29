@@ -1,599 +1,1082 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createDesktopApi, desktopApi, friendlyDesktopError, type DesktopApi } from './api/desktopApi'
+import { ConnectionsView } from './components/ConnectionsView'
+import {
+  ConfirmationDialog,
+  DirtyDecisionDialog,
+  StatusPill,
+} from './components/Common'
+import { EffectiveContextView } from './components/EffectiveContextView'
+import { InboxView } from './components/InboxView'
+import { LibraryView } from './components/LibraryView'
+import { Onboarding } from './components/Onboarding'
+import {
+  type PrimaryView,
+  QuickOpen,
+  type QuickOpenItem,
+  type QuickOpenTarget,
+} from './components/QuickOpen'
+import { SearchView } from './components/SearchView'
+import {
+  draftFromEntry,
+  emptyEntryDraft,
+  entryDraftToInput,
+  isEntryDraftDirty,
+  type EntryDraft,
+} from './lib/entryDraft'
+import {
+  type ConfirmationRequest,
+  formatTimestamp,
+  scopeLayerDetail,
+  scopeLayerLabel,
+} from './lib/ui'
+import { flattenWorkspace } from './lib/contextUtils'
 import type {
-  AdapterStatus,
+  BulkReviewDecisionResult,
+  ContextEntry,
   ContextPack,
-  ContextPreview,
   DashboardSnapshot,
   ReviewDecision,
+  ReviewItem,
   RevisionEntry,
-  SavePackInput,
   SearchResult,
-  Settings,
 } from './types'
-import { createDesktopApi, desktopApi, type DesktopApi } from './api/desktopApi'
-import { flattenWorkspace, type FlatScopeNode } from './lib/contextUtils'
 import './App.css'
-
-type MainView = 'overview' | 'review' | 'operations'
-type LoadState = 'loading' | 'ready' | 'error'
-type BannerTone = 'success' | 'error' | 'info'
-
-interface PackEditorDraft {
-  id?: string
-  scopeId: string
-  name: string
-  status: ContextPack['status']
-  summary: string
-  tags: string
-  body: string
-}
 
 interface AppProps {
   api?: DesktopApi
 }
 
-const NEW_PACK_ID = '__new_pack__'
-const DEFAULT_EXPORT_PATH = '~/Desktop/context-manager-export.json'
-const views: Array<{ id: MainView; label: string; description: string }> = [
-  { id: 'overview', label: 'Overview', description: 'Packs, previews, and run activity.' },
-  { id: 'review', label: 'Search & review', description: 'FTS search, queue triage, and restore.' },
-  { id: 'operations', label: 'Operations', description: 'Adapters, import/export, and local settings.' },
+interface ReviewEditDraft {
+  reviewId: string
+  draft: string
+  baseline: string
+}
+
+const navigation: Array<{
+  id: PrimaryView
+  label: string
+  glyph: string
+  description: string
+}> = [
+  { id: 'inbox', label: 'Inbox', glyph: '◎', description: 'Review queued changes' },
+  { id: 'library', label: 'Library', glyph: '▤', description: 'Edit durable entries' },
+  { id: 'effective', label: 'Effective Context', glyph: '≡', description: 'Inspect exact output' },
+  { id: 'search', label: 'Search', glyph: '⌕', description: 'Find local records' },
+  { id: 'connections', label: 'Connections', glyph: '⌁', description: 'Health, policy, and privacy' },
 ]
 
-function formatTimestamp(value: string) {
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  }).format(new Date(value))
-}
-
-function formatDuration(value: number) {
-  const minutes = Math.round(value / 60000)
-  if (minutes < 60) {
-    return `${minutes}m`
-  }
-
-  const hours = Math.floor(minutes / 60)
-  const remainder = minutes % 60
-  return remainder === 0 ? `${hours}h` : `${hours}h ${remainder}m`
-}
-
-function statusTone(value: string) {
-  const normalized = value.toLowerCase()
-  if (normalized === 'active' || normalized === 'healthy' || normalized === 'completed' || normalized === 'synced') {
-    return 'positive'
-  }
-  if (normalized === 'draft' || normalized === 'review' || normalized === 'degraded' || normalized === 'running' || normalized === 'in progress' || normalized === 'queued' || normalized === 'monitoring' || normalized === 'needs review') {
-    return 'warning'
-  }
-  if (normalized === 'offline' || normalized === 'failed' || normalized === 'blocked') {
-    return 'negative'
-  }
-  return 'neutral'
-}
-
-function emptyDraft(scopeId: string): PackEditorDraft {
-  return {
-    scopeId,
-    name: '',
-    status: 'draft',
-    summary: '',
-    tags: 'draft, review',
-    body: '',
-  }
-}
-
-function draftFromPack(pack: ContextPack): PackEditorDraft {
-  return {
-    id: pack.id,
-    scopeId: pack.scopeId,
-    name: pack.name,
-    status: pack.status,
-    summary: pack.summary,
-    tags: pack.tags.join(', '),
-    body: pack.body,
-  }
-}
-
-function packsForScope(snapshot: DashboardSnapshot | null, scopeId: string) {
-  if (!snapshot) {
-    return []
-  }
-
-  return snapshot.packs.filter((pack) => pack.scopeId === scopeId)
-}
-
-function findFirstPackId(snapshot: DashboardSnapshot, scopeId: string) {
-  return packsForScope(snapshot, scopeId)[0]?.id ?? NEW_PACK_ID
-}
-
-function bannerMessage(tone: BannerTone, message: string) {
-  return { tone, message }
-}
-
-function Card({
-  title,
-  subtitle,
-  actions,
-  children,
-}: {
-  title: string
-  subtitle?: string
-  actions?: ReactNode
-  children: ReactNode
-}) {
+function firstEntryForScope(snapshot: DashboardSnapshot, scopeId: string) {
   return (
-    <section className="card">
-      <header className="card-header">
-        <div>
-          <h2>{title}</h2>
-          {subtitle ? <p className="card-subtitle">{subtitle}</p> : null}
-        </div>
-        {actions ? <div className="card-actions">{actions}</div> : null}
-      </header>
-      {children}
-    </section>
+    snapshot.entries.find((entry) => entry.scopeId === scopeId && entry.status === 'active') ??
+    snapshot.entries.find((entry) => entry.scopeId === scopeId)
   )
 }
 
-function EmptyState({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="empty-state" role="status">
-      <strong>{title}</strong>
-      <p>{body}</p>
-    </div>
-  )
+function selectedPackForNewEntry(snapshot: DashboardSnapshot, scopeId: string) {
+  return snapshot.packs.find((pack) => pack.scopeId === scopeId)
 }
 
-function StatusPill({ label, tone }: { label: string; tone: string }) {
-  return <span className={`status-pill status-pill--${tone}`}>{label}</span>
-}
-
-function SummaryMetric({ value, label, detail }: { value: string; label: string; detail: string }) {
-  return (
-    <article className="metric-card">
-      <p className="metric-value">{value}</p>
-      <p className="metric-label">{label}</p>
-      <p className="metric-detail">{detail}</p>
-    </article>
-  )
-}
-
-function SearchResultRow({ result }: { result: SearchResult }) {
-  return (
-    <li className="result-row">
-      <div>
-        <div className="row-heading">
-          <strong>{result.title}</strong>
-          <StatusPill label={result.kind} tone="neutral" />
-        </div>
-        <p>{result.excerpt}</p>
-        <div className="row-meta">
-          <span>{result.scopeLabel}</span>
-          <span>{formatTimestamp(result.updatedAt)}</span>
-          <span>score {result.score}</span>
-        </div>
-      </div>
-    </li>
-  )
-}
-
-function ScopeButton({
-  node,
-  selected,
-  onSelect,
-}: {
-  node: FlatScopeNode
-  selected: boolean
-  onSelect: (scopeId: string) => void
-}) {
-  return (
-    <button
-      type="button"
-      className={`scope-button ${selected ? 'scope-button--selected' : ''}`}
-      onClick={() => onSelect(node.id)}
-      aria-pressed={selected}
-    >
-      <div className="scope-button__meta">
-        <span className="scope-button__kind">{node.kind}</span>
-        <StatusPill label={node.status} tone={statusTone(node.status)} />
-      </div>
-      <strong style={{ paddingLeft: `${node.depth * 12}px` }}>{node.label}</strong>
-      <span>{node.description}</span>
-    </button>
-  )
-}
-
-function AdapterRow({
-  adapter,
-  onToggle,
-  disabled,
-}: {
-  adapter: AdapterStatus
-  onToggle: (adapter: AdapterStatus) => void
-  disabled: boolean
-}) {
-  return (
-    <li className="adapter-row">
-      <div>
-        <div className="row-heading">
-          <strong>{adapter.name}</strong>
-          <StatusPill label={adapter.health} tone={statusTone(adapter.health)} />
-        </div>
-        <p>{adapter.note}</p>
-        <div className="row-meta">
-          <span>{adapter.kind}</span>
-          <span>{adapter.path}</span>
-          <span>{formatTimestamp(adapter.lastCheckedAt)}</span>
-        </div>
-      </div>
-      <label className="toggle">
-        <input
-          type="checkbox"
-          checked={adapter.enabled}
-          disabled={disabled}
-          onChange={() => onToggle(adapter)}
-        />
-        <span>{adapter.enabled ? 'Monitored' : 'Ignored'}</span>
-      </label>
-    </li>
+function entryForReview(snapshot: DashboardSnapshot, review: ReviewItem) {
+  return snapshot.entries.find(
+    (entry) =>
+      entry.scopeId === review.scopeId &&
+      entry.packId === review.packId &&
+      entry.key === review.entryKey,
   )
 }
 
 function App({ api = desktopApi }: AppProps) {
-  const [loadState, setLoadState] = useState<LoadState>('loading')
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null)
-  const [preview, setPreview] = useState<ContextPreview | null>(null)
-  const [revisions, setRevisions] = useState<RevisionEntry[]>([])
+  const [activeView, setActiveView] = useState<PrimaryView>('library')
   const [selectedScopeId, setSelectedScopeId] = useState('')
-  const [selectedPackId, setSelectedPackId] = useState(NEW_PACK_ID)
+  const [selectedEntryId, setSelectedEntryId] = useState('')
   const [selectedReviewId, setSelectedReviewId] = useState('')
-  const [reviewDraft, setReviewDraft] = useState('')
-  const [editorDraft, setEditorDraft] = useState<PackEditorDraft>(emptyDraft(''))
-  const [activeView, setActiveView] = useState<MainView>('overview')
-  const [searchQuery, setSearchQuery] = useState('')
-  const [searchResults, setSearchResults] = useState<SearchResult[]>([])
-  const [searchLoading, setSearchLoading] = useState(false)
-  const [settingsDraft, setSettingsDraft] = useState<Settings | null>(null)
-  const [banner, setBanner] = useState<{ tone: BannerTone; message: string } | null>(null)
+  const [reviewEdit, setReviewEdit] = useState<ReviewEditDraft | null>(null)
+  const [entryDraft, setEntryDraft] = useState<EntryDraft>(emptyEntryDraft(''))
+  const [revisions, setRevisions] = useState<RevisionEntry[]>([])
+  const [focusRevisionId, setFocusRevisionId] = useState<string>()
+  const [focusedConnectionId, setFocusedConnectionId] = useState<string>()
+  const [focusedRunId, setFocusedRunId] = useState<string>()
+  const [quickOpen, setQuickOpen] = useState(false)
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null)
+  const [confirmationBusy, setConfirmationBusy] = useState(false)
+  const [dirtyDialog, setDirtyDialog] = useState(false)
+  const [dirtyBusy, setDirtyBusy] = useState(false)
   const [busyKey, setBusyKey] = useState('')
-  const [ioPath, setIoPath] = useState(DEFAULT_EXPORT_PATH)
+  const [bulkResult, setBulkResult] = useState<BulkReviewDecisionResult | null>(null)
+  const [notice, setNotice] = useState<{
+    message: string
+    actionLabel?: string
+    action?: () => void
+  } | null>(null)
+  const [errorMessage, setErrorMessage] = useState('')
+  const [liveMessage, setLiveMessage] = useState('')
+  const pendingProtectedAction = useRef<(() => void | Promise<void>) | null>(null)
+  const reviewDecisionInFlightRef = useRef(false)
+  const snapshotRef = useRef<DashboardSnapshot | null>(null)
+  snapshotRef.current = snapshot
 
-  const scopes = useMemo(() => flattenWorkspace(snapshot?.workspace ?? []), [snapshot])
-  const currentScope = scopes.find((scope) => scope.id === selectedScopeId)
-  const currentPacks = useMemo(
-    () => packsForScope(snapshot, selectedScopeId),
-    [snapshot, selectedScopeId],
+  const scopes = useMemo(
+    () => flattenWorkspace(snapshot?.workspace ?? []),
+    [snapshot?.workspace],
   )
-  const selectedPack = currentPacks.find((pack) => pack.id === selectedPackId)
-  const selectedReview = snapshot?.reviewQueue.find((item) => item.id === selectedReviewId) ?? null
+  const currentScope = scopes.find((scope) => scope.id === selectedScopeId)
+  const selectedEntry = snapshot?.entries.find(
+    (entry) => entry.id === selectedEntryId && entry.scopeId === selectedScopeId,
+  )
+  const selectedReview =
+    snapshot?.reviewQueue.find((review) => review.id === selectedReviewId) ?? null
+  const editorDirty = Boolean(
+    snapshot &&
+      entryDraft.scopeId === selectedScopeId &&
+      isEntryDraftDirty(entryDraft, selectedEntry),
+  )
+  const reviewEditDirty = Boolean(
+    reviewEdit &&
+      reviewEdit.reviewId === selectedReviewId &&
+      reviewEdit.draft !== reviewEdit.baseline,
+  )
+  const activeDirtyKind =
+    activeView === 'inbox' && reviewEditDirty
+      ? 'review'
+      : activeView === 'library' && editorDirty
+        ? 'entry'
+        : null
+  const anyDialogOpen = quickOpen || Boolean(confirmation) || dirtyDialog
+  const reviewDecisionBusy = busyKey.startsWith('review-')
 
-  async function refreshDashboard(preferredScopeId?: string, preferredPackId?: string) {
-    const nextSnapshot = await api.loadDashboard()
-    const nextScopeId =
-      preferredScopeId && nextSnapshot.workspace.length > 0
-        ? flattenWorkspace(nextSnapshot.workspace).some((scope) => scope.id === preferredScopeId)
-          ? preferredScopeId
-          : nextSnapshot.selectedScopeId
-        : nextSnapshot.selectedScopeId
-    const nextPackId =
-      preferredPackId && nextSnapshot.packs.some((pack) => pack.id === preferredPackId)
-        ? preferredPackId
-        : findFirstPackId(nextSnapshot, nextScopeId)
+  const announce = useCallback((message: string) => {
+    setErrorMessage('')
+    setNotice({ message })
+    setLiveMessage('')
+    window.setTimeout(() => setLiveMessage(message), 0)
+  }, [])
 
-    setSnapshot(nextSnapshot)
-    setSelectedScopeId(nextScopeId)
-    setSelectedPackId(nextPackId)
-    setSelectedReviewId(nextSnapshot.reviewQueue[0]?.id ?? '')
-    setSettingsDraft(nextSnapshot.settings)
+  const showError = useCallback((message: string) => {
+    setErrorMessage(message)
+    setLiveMessage('')
+  }, [])
+
+  const handleApiError = useCallback(
+    (error: unknown) => showError(friendlyDesktopError(error)),
+    [showError],
+  )
+
+  const refreshDashboard = useCallback(
+    async (preferred?: { scopeId?: string; entryId?: string; reviewId?: string }) => {
+      const next = await api.loadDashboard()
+      const flattened = flattenWorkspace(next.workspace)
+      const nextScopeId =
+        preferred?.scopeId && flattened.some((scope) => scope.id === preferred.scopeId)
+          ? preferred.scopeId
+          : flattened.some((scope) => scope.id === next.selectedScopeId)
+            ? next.selectedScopeId
+            : selectedScopeId && flattened.some((scope) => scope.id === selectedScopeId)
+              ? selectedScopeId
+              : flattened[0]?.id ?? ''
+      const requestedEntryId = preferred?.entryId ?? selectedEntryId
+      const requestedEntry = next.entries.find(
+        (entry) => entry.id === requestedEntryId && entry.scopeId === nextScopeId,
+      )
+      const nextEntry = requestedEntry ?? firstEntryForScope(next, nextScopeId)
+      const requestedReviewId = preferred?.reviewId ?? selectedReviewId
+
+      setSnapshot(next)
+      setSelectedScopeId(nextScopeId)
+      setSelectedEntryId(nextEntry?.id ?? '')
+      setEntryDraft(
+        nextEntry
+          ? draftFromEntry(nextEntry)
+          : emptyEntryDraft(nextScopeId, selectedPackForNewEntry(next, nextScopeId)),
+      )
+      setSelectedReviewId(
+        next.reviewQueue.some((review) => review.id === requestedReviewId)
+          ? requestedReviewId
+          : next.reviewQueue[0]?.id ?? '',
+      )
+      if (!next.reviewQueue.some((review) => review.id === reviewEdit?.reviewId)) {
+        setReviewEdit(null)
+      }
+      return next
+    },
+    [api, reviewEdit?.reviewId, selectedEntryId, selectedReviewId, selectedScopeId],
+  )
+
+  function commitEntryContext(
+    scopeId: string,
+    entry: ContextEntry | undefined,
+    options: {
+      view?: PrimaryView
+      revisionId?: string
+      focus?: 'editor' | 'history'
+      pack?: ContextPack
+    } = {},
+  ) {
+    if (entry && entry.scopeId !== scopeId) {
+      showError('The selected entry does not belong to the current scope. Refresh and try again.')
+      return false
+    }
+    setSelectedScopeId(scopeId)
+    setSelectedEntryId(entry?.id ?? '')
+    setEntryDraft(
+      entry
+        ? draftFromEntry(entry)
+        : emptyEntryDraft(
+            scopeId,
+            options.pack ??
+              (snapshotRef.current
+              ? selectedPackForNewEntry(snapshotRef.current, scopeId)
+              : undefined),
+          ),
+    )
+    setFocusRevisionId(options.revisionId)
+    if (options.view) setActiveView(options.view)
+    setErrorMessage('')
+    window.setTimeout(() => {
+      if (options.focus === 'history' && options.revisionId) {
+        document
+          .getElementById(`history-${options.revisionId}`)
+          ?.querySelector<HTMLElement>('button')
+          ?.focus()
+      } else if (options.focus === 'editor') {
+        document.getElementById('entry-editor')?.focus()
+      }
+    }, 0)
+    return true
+  }
+
+  async function persistAndCommitEntry(
+    entry: ContextEntry,
+    options: { revisionId?: string; focus?: 'editor' | 'history' } = {},
+  ) {
+    await api.setSelectedScope(entry.scopeId)
+    commitEntryContext(entry.scopeId, entry, {
+      view: 'library',
+      revisionId: options.revisionId,
+      focus: options.focus ?? (options.revisionId ? 'history' : 'editor'),
+    })
+  }
+
+  async function persistAndCommitScope(scopeId: string, view?: PrimaryView) {
+    const current = snapshotRef.current
+    if (!current) return
+    await api.setSelectedScope(scopeId)
+    const entry = firstEntryForScope(current, scopeId)
+    commitEntryContext(scopeId, entry, { view })
+  }
+
+  function mergeEntryLocally(entry: ContextEntry) {
+    setSnapshot((current) => {
+      if (!current) return current
+      const exists = current.entries.some((candidate) => candidate.id === entry.id)
+      return {
+        ...current,
+        entries: exists
+          ? current.entries.map((candidate) => (candidate.id === entry.id ? entry : candidate))
+          : [entry, ...current.entries],
+      }
+    })
+    commitEntryContext(entry.scopeId, entry)
+  }
+
+  function showStaleMutationNotice(
+    successMessage: string,
+    preferred?: { scopeId?: string; entryId?: string; reviewId?: string },
+  ) {
+    setNotice({
+      message: `${successMessage} The displayed state could not refresh and may be stale. Do not repeat the mutation.`,
+      actionLabel: 'Refresh view',
+      action: () => {
+        void refreshDashboard(preferred).catch(handleApiError)
+      },
+    })
+    setLiveMessage(successMessage)
   }
 
   useEffect(() => {
     let cancelled = false
-
     async function load() {
       try {
-        setLoadState('loading')
-        const nextSnapshot = await api.loadDashboard()
-        if (cancelled) {
-          return
-        }
-
-        const firstScopeId = nextSnapshot.selectedScopeId
-        setSnapshot(nextSnapshot)
-        setSelectedScopeId(firstScopeId)
-        setSelectedPackId(findFirstPackId(nextSnapshot, firstScopeId))
-        setSelectedReviewId(nextSnapshot.reviewQueue[0]?.id ?? '')
-        setSettingsDraft(nextSnapshot.settings)
+        const next = await api.loadDashboard()
+        if (cancelled) return
+        const scopeId = next.selectedScopeId
+        const entry = firstEntryForScope(next, scopeId)
+        setSnapshot(next)
+        setSelectedScopeId(scopeId)
+        setSelectedEntryId(entry?.id ?? '')
+        setEntryDraft(
+          entry
+            ? draftFromEntry(entry)
+            : emptyEntryDraft(scopeId, selectedPackForNewEntry(next, scopeId)),
+        )
+        setSelectedReviewId(next.reviewQueue[0]?.id ?? '')
         setLoadState('ready')
       } catch (error) {
         if (!cancelled) {
           setLoadState('error')
-          setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Failed to load the desktop control plane.'))
+          handleApiError(error)
         }
       }
     }
-
     void load()
-
     return () => {
       cancelled = true
     }
-  }, [api])
+  }, [api, handleApiError])
 
   useEffect(() => {
-    if (!snapshot || !selectedScopeId) {
-      return
-    }
-
-    let cancelled = false
-
-    async function loadPreview() {
-      try {
-        const nextPreview = await api.composePreview(selectedScopeId)
-        if (!cancelled) {
-          setPreview(nextPreview)
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to compose the preview.'))
-          setPreview(null)
-        }
-      }
-    }
-
-    void loadPreview()
-
-    return () => {
-      cancelled = true
-    }
-  }, [api, snapshot, selectedScopeId])
-
-  useEffect(() => {
-    if (!snapshot) {
-      return
-    }
-
-    if (selectedPackId === NEW_PACK_ID) {
-      setEditorDraft(emptyDraft(selectedScopeId))
+    if (!snapshot || !selectedEntry) {
       setRevisions([])
       return
     }
-
-    const pack = snapshot.packs.find((candidate) => candidate.id === selectedPackId)
-    if (!pack) {
-      return
-    }
-
-    setEditorDraft(draftFromPack(pack))
-    const packId = pack.id
-
     let cancelled = false
-
-    async function loadRevisions() {
-      try {
-        const nextRevisions = await api.listRevisions(packId)
+    void api
+      .listRevisions(selectedEntry.packId)
+      .then((result) => {
         if (!cancelled) {
-          setRevisions(nextRevisions)
+          setRevisions(result.filter((revision) => revision.entityId === selectedEntry.id))
         }
-      } catch (error) {
-        if (!cancelled) {
-          setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to load revision history.'))
-          setRevisions([])
-        }
-      }
-    }
-
-    void loadRevisions()
-
-    return () => {
-      cancelled = true
-    }
-  }, [api, selectedPackId, selectedScopeId, snapshot])
-
-  useEffect(() => {
-    if (!selectedReview) {
-      setReviewDraft('')
-      return
-    }
-
-    setReviewDraft(selectedReview.suggestedEdit)
-  }, [selectedReview])
-
-  useEffect(() => {
-    if (!searchQuery.trim()) {
-      setSearchResults([])
-      setSearchLoading(false)
-      return
-    }
-
-    let cancelled = false
-    const timeout = window.setTimeout(async () => {
-      try {
-        setSearchLoading(true)
-        const results = await api.searchIndex(searchQuery)
-        if (!cancelled) {
-          setSearchResults(results)
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Search failed.'))
-          setSearchResults([])
-        }
-      } finally {
-        if (!cancelled) {
-          setSearchLoading(false)
-        }
-      }
-    }, 180)
-
-    return () => {
-      cancelled = true
-      window.clearTimeout(timeout)
-    }
-  }, [api, searchQuery])
-
-  function handleScopeChange(scopeId: string) {
-    if (!snapshot) {
-      return
-    }
-
-    setSelectedScopeId(scopeId)
-    setSelectedPackId(findFirstPackId(snapshot, scopeId))
-    setBanner(null)
-  }
-
-  async function handleSavePack() {
-    if (!selectedScopeId) {
-      return
-    }
-
-    const payload: SavePackInput = {
-      id: editorDraft.id,
-      scopeId: selectedScopeId,
-      name: editorDraft.name,
-      status: editorDraft.status,
-      summary: editorDraft.summary,
-      tags: editorDraft.tags
-        .split(',')
-        .map((tag) => tag.trim())
-        .filter(Boolean),
-      body: editorDraft.body,
-    }
-
-    try {
-      setBusyKey('save-pack')
-      const saved = await api.savePack(payload)
-      await refreshDashboard(selectedScopeId, saved.id)
-      setLoadState('ready')
-      setBanner(bannerMessage('success', `Saved ${saved.name} to ${saved.scopeLabel}.`))
-    } catch (error) {
-      setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to save the pack.'))
-    } finally {
-      setBusyKey('')
-    }
-  }
-
-  async function handleReviewAction(decision: ReviewDecision) {
-    if (!selectedReview) {
-      return
-    }
-
-    try {
-      setBusyKey(`review-${decision}`)
-      await api.reviewDecision({
-        itemId: selectedReview.id,
-        decision,
-        editedContent: decision === 'edit' ? reviewDraft : undefined,
       })
-      await refreshDashboard(selectedReview.scopeId, selectedReview.packId)
-      setBanner(
-        bannerMessage(
-          'success',
-          decision === 'reject'
-            ? `Rejected ${selectedReview.title}.`
-            : `Applied ${decision === 'approve' ? 'approved' : 'edited'} review update for ${selectedReview.packName}.`,
-        ),
-      )
-    } catch (error) {
-      setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to process the review item.'))
-    } finally {
-      setBusyKey('')
+      .catch((error) => {
+        if (!cancelled) handleApiError(error)
+      })
+    return () => {
+      cancelled = true
     }
-  }
+  }, [api, handleApiError, selectedEntry, snapshot])
 
-  async function handleRestore(revision: RevisionEntry) {
+  useEffect(() => {
+    function handleBeforeUnload(event: BeforeUnloadEvent) {
+      if (!editorDirty && !reviewEditDirty) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [editorDirty, reviewEditDirty])
+
+  useEffect(() => {
+    function handleGlobalKeyDown(event: KeyboardEvent) {
+      if (event.isComposing) return
+      if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'k') {
+        if (confirmation || dirtyDialog) return
+        event.preventDefault()
+        setQuickOpen(true)
+      }
+    }
+    window.addEventListener('keydown', handleGlobalKeyDown)
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown)
+  }, [confirmation, dirtyDialog])
+
+  async function saveEntry() {
+    if (!snapshot) return false
+    if (
+      entryDraft.scopeId !== selectedScopeId ||
+      (selectedEntry && selectedEntry.scopeId !== selectedScopeId)
+    ) {
+      showError('The draft no longer matches the selected scope. Refresh before saving.')
+      return false
+    }
+    if (entryDraft.format === 'json') {
+      try {
+        JSON.parse(entryDraft.body)
+      } catch {
+        showError('Enter valid JSON before saving. Nothing was stored.')
+        return false
+      }
+    }
+    setBusyKey('save-entry')
+    let saved: ContextEntry
     try {
-      setBusyKey(`restore-${revision.id}`)
-      const result = await api.restoreRevision(revision.id)
-      await refreshDashboard(selectedScopeId, result.entityId)
-      setBanner(bannerMessage('success', `Restored ${revision.entityLabel} from ${revision.id}.`))
+      saved = await api.saveEntry(entryDraftToInput(entryDraft))
     } catch (error) {
-      setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to restore the revision.'))
-    } finally {
+      handleApiError(error)
       setBusyKey('')
+      return false
     }
-  }
 
-  async function handleToggleAdapter(adapter: AdapterStatus) {
+    mergeEntryLocally(saved)
     try {
-      setBusyKey(`adapter-${adapter.id}`)
-      await api.toggleAdapter(adapter.id, !adapter.enabled)
-      await refreshDashboard(selectedScopeId, selectedPackId === NEW_PACK_ID ? undefined : selectedPackId)
-      setBanner(
-        bannerMessage(
-          'success',
-          `${adapter.name} ${adapter.enabled ? 'disabled' : 'enabled'} locally.`,
-        ),
+      const next = await refreshDashboard({ scopeId: saved.scopeId, entryId: saved.id })
+      const refreshed = next.entries.find(
+        (entry) => entry.id === saved.id && entry.scopeId === saved.scopeId,
       )
-    } catch (error) {
-      setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to update the adapter.'))
+      if (refreshed) commitEntryContext(refreshed.scopeId, refreshed)
+      setNotice({
+        message: `Saved ${saved.title ?? saved.key}. Only this entry was updated.`,
+        actionLabel: 'Open history',
+        action: () => requestEntryHistory(saved.id, saved.scopeId),
+      })
+      setLiveMessage(`Saved ${saved.title ?? saved.key}.`)
+    } catch {
+      showStaleMutationNotice(
+        `Saved ${saved.title ?? saved.key}.`,
+        { scopeId: saved.scopeId, entryId: saved.id },
+      )
     } finally {
       setBusyKey('')
     }
+    return true
   }
 
-  async function handleSaveSettings() {
-    if (!settingsDraft) {
+  function runProtected(action: () => void | Promise<void>) {
+    if (
+      (activeView === 'library' && editorDirty) ||
+      (activeView === 'inbox' && reviewEditDirty)
+    ) {
+      pendingProtectedAction.current = action
+      setDirtyDialog(true)
       return
     }
+    void action()
+  }
 
+  function selectEntry(entryId: string) {
+    if (!snapshot) return
+    const entry = snapshot.entries.find(
+      (candidate) => candidate.id === entryId && candidate.scopeId === selectedScopeId,
+    )
+    if (!entry) return
+    runProtected(() => {
+      commitEntryContext(selectedScopeId, entry)
+    })
+  }
+
+  function startNewEntry() {
+    if (!snapshot) return
+    runProtected(() => {
+      commitEntryContext(selectedScopeId, undefined)
+    })
+  }
+
+  function changeScope(scopeId: string, nextView?: PrimaryView) {
+    if (!snapshot) return
+    if (scopeId === selectedScopeId) {
+      if (nextView) changeView(nextView)
+      return
+    }
+    runProtected(async () => {
+      try {
+        await persistAndCommitScope(scopeId, nextView)
+      } catch (error) {
+        handleApiError(error)
+      }
+    })
+  }
+
+  function changeView(view: PrimaryView) {
+    if (view === activeView) return
+    runProtected(() => {
+      setActiveView(view)
+      if (activeView === 'inbox') setReviewEdit(null)
+      setFocusedConnectionId(undefined)
+      setFocusedRunId(undefined)
+      setErrorMessage('')
+    })
+  }
+
+  function requestEntryHistory(entryId: string, scopeId: string, revisionId?: string) {
+    const current = snapshotRef.current
+    if (!current) return
+    const entry = current.entries.find(
+      (candidate) => candidate.id === entryId && candidate.scopeId === scopeId,
+    )
+    if (!entry) {
+      showError('That entry is no longer available. Refresh before opening history.')
+      return
+    }
+    runProtected(async () => {
+      try {
+        await persistAndCommitEntry(entry, { revisionId, focus: 'history' })
+      } catch (error) {
+        handleApiError(error)
+      }
+    })
+  }
+
+  async function finishEntryMutation(entry: ContextEntry, successMessage: string) {
+    mergeEntryLocally(entry)
     try {
-      setBusyKey('save-settings')
-      await api.saveSettings(settingsDraft)
-      await refreshDashboard(selectedScopeId, selectedPackId === NEW_PACK_ID ? undefined : selectedPackId)
-      setBanner(bannerMessage('success', 'Saved desktop settings.'))
-    } catch (error) {
-      setBanner(bannerMessage('error', error instanceof Error ? error.message : 'Unable to save settings.'))
-    } finally {
-      setBusyKey('')
+      await refreshDashboard({ scopeId: entry.scopeId, entryId: entry.id })
+      setNotice({
+        message: successMessage,
+        actionLabel: 'Open history',
+        action: () => requestEntryHistory(entry.id, entry.scopeId),
+      })
+      setLiveMessage(successMessage)
+    } catch {
+      showStaleMutationNotice(successMessage, {
+        scopeId: entry.scopeId,
+        entryId: entry.id,
+      })
     }
   }
 
-  async function handleArchive(direction: 'import' | 'export') {
+  function requestArchive(entry: ContextEntry) {
+    runProtected(() => {
+      setConfirmation({
+        title: 'Archive this entry?',
+        description:
+          'Only this entry will be archived. Sibling entries in the same pack remain unchanged.',
+        confirmLabel: 'Archive entry',
+        tone: 'danger',
+        action: async () => {
+          const archived = await api.archiveEntry(entry.id)
+          await finishEntryMutation(
+            archived,
+            `${archived.title ?? archived.key} was archived.`,
+          )
+        },
+      })
+    })
+  }
+
+  function requestRestoreEntry(entry: ContextEntry) {
+    runProtected(() => {
+      setConfirmation({
+        title: 'Restore this entry?',
+        description:
+          'The backend will create a new active revision. Existing sibling entries are not changed.',
+        confirmLabel: 'Restore entry',
+        action: async () => {
+          const restored = await api.restoreEntry(entry.id)
+          await finishEntryMutation(
+            restored,
+            `${restored.title ?? restored.key} was restored as a new revision.`,
+          )
+        },
+      })
+    })
+  }
+
+  function requestRevertPrevious(entry: ContextEntry) {
+    const revision = entry.revision - 1
+    runProtected(() => {
+      setConfirmation({
+        title: `Revert to revision ${revision}?`,
+        description:
+          'The selected historical value becomes a new active revision. The current revision remains in history.',
+        confirmLabel: 'Revert entry',
+        action: async () => {
+          const restored = await api.revertEntryRevision({
+            entryId: entry.id,
+            revision,
+            actor: 'desktop-operator',
+          })
+          await finishEntryMutation(
+            restored,
+            `${restored.title ?? restored.key} was reverted into a new revision.`,
+          )
+        },
+      })
+    })
+  }
+
+  function requestRestoreRevision(revision: RevisionEntry) {
+    if (!selectedEntry) return
+    const scopeId = selectedEntry.scopeId
+    runProtected(() => {
+      setConfirmation({
+        title: 'Restore this historical revision?',
+        description:
+          'The backend restores the selected snapshot as a new revision. Later history remains available.',
+        confirmLabel: 'Restore revision',
+        action: async () => {
+          const result = await api.restoreRevision(revision.id)
+          try {
+            const next = await refreshDashboard({
+              scopeId,
+              entryId: result.entityId,
+            })
+            const restored = next.entries.find(
+              (entry) => entry.id === result.entityId && entry.scopeId === scopeId,
+            )
+            setNotice({
+              message: `${revision.entityLabel} was restored from history.`,
+              actionLabel: restored ? 'Open history' : 'Refresh view',
+              action: () =>
+                restored
+                  ? requestEntryHistory(restored.id, restored.scopeId)
+                  : void refreshDashboard({ scopeId, entryId: result.entityId }).catch(
+                      handleApiError,
+                    ),
+            })
+            setLiveMessage(`${revision.entityLabel} was restored.`)
+          } catch {
+            showStaleMutationNotice(
+              `${revision.entityLabel} was restored from history.`,
+              { scopeId, entryId: result.entityId },
+            )
+          }
+        },
+      })
+    })
+  }
+
+  function selectReview(reviewId: string, openInbox = false) {
+    if (!snapshot) return
+    const review = snapshot.reviewQueue.find((candidate) => candidate.id === reviewId)
+    if (!review && reviewId) return
+    runProtected(async () => {
+      try {
+        if (review && review.scopeId !== selectedScopeId) {
+          await persistAndCommitScope(review.scopeId)
+        }
+        setSelectedReviewId(review?.id ?? '')
+        setReviewEdit(null)
+        if (openInbox) setActiveView('inbox')
+        window.setTimeout(() => document.getElementById('review-detail')?.focus(), 0)
+      } catch (error) {
+        handleApiError(error)
+      }
+    })
+  }
+
+  function startReviewEdit(review: ReviewItem) {
+    setReviewEdit({
+      reviewId: review.id,
+      draft: review.suggestedEdit,
+      baseline: review.suggestedEdit,
+    })
+  }
+
+  async function reviewDecision(
+    decision: ReviewDecision,
+    review: ReviewItem,
+    editedContent?: string,
+  ): Promise<boolean> {
+    if (reviewDecisionInFlightRef.current) return false
+    reviewDecisionInFlightRef.current = true
+    setBusyKey(`review-${decision}`)
     try {
-      setBusyKey(direction)
-      const summary =
-        direction === 'export' ? await api.exportArchive(ioPath) : await api.importArchive(ioPath)
-      await refreshDashboard(selectedScopeId, selectedPackId === NEW_PACK_ID ? undefined : selectedPackId)
-      setBanner(
-        bannerMessage(
-          'success',
-          `${direction === 'export' ? 'Exported' : 'Imported'} ${summary.packsImported} packs at ${summary.path}.`,
-        ),
-      )
+      await api.reviewDecision({ itemId: review.id, decision, editedContent })
     } catch (error) {
-      setBanner(
-        bannerMessage(
-          'error',
-          error instanceof Error ? error.message : `Unable to ${direction} the local archive.`,
-        ),
+      handleApiError(error)
+      reviewDecisionInFlightRef.current = false
+      setBusyKey('')
+      return false
+    }
+
+    setReviewEdit(null)
+    setSnapshot((current) =>
+      current
+        ? {
+            ...current,
+            reviewQueue: current.reviewQueue.filter((item) => item.id !== review.id),
+          }
+        : current,
+    )
+    try {
+      const next = await refreshDashboard({ scopeId: review.scopeId })
+      const historyEntry = entryForReview(next, review)
+      const message =
+        decision === 'reject'
+          ? `${review.title} was rejected.`
+          : `${review.title} was ${decision === 'edit' ? 'edited and approved' : 'approved'}.`
+      setNotice(
+        historyEntry
+          ? {
+              message,
+              actionLabel: 'Open history',
+              action: () => requestEntryHistory(historyEntry.id, historyEntry.scopeId),
+            }
+          : { message },
+      )
+      setLiveMessage(`${review.title} review completed.`)
+    } catch {
+      showStaleMutationNotice(
+        `${review.title} was ${
+          decision === 'reject'
+            ? 'rejected'
+            : decision === 'edit'
+              ? 'edited and approved'
+              : 'approved'
+        }.`,
+        { scopeId: review.scopeId },
       )
     } finally {
+      reviewDecisionInFlightRef.current = false
       setBusyKey('')
+    }
+    return true
+  }
+
+  function requestBulkDecision(
+    decision: 'approve' | 'reject',
+    itemIds: string[],
+  ) {
+    if (!snapshot) return
+    const reviews = itemIds
+      .map((id) => snapshot.reviewQueue.find((review) => review.id === id))
+      .filter((review): review is ReviewItem => Boolean(review))
+    runProtected(() => setConfirmation({
+      title: `${decision === 'approve' ? 'Approve' : 'Reject'} ${reviews.length} reviews?`,
+      description:
+        'Bulk actions can complete partially. The result will list every attempted item, then the Inbox will refresh.',
+      confirmLabel: `${decision === 'approve' ? 'Approve' : 'Reject'} selected`,
+      tone: decision === 'reject' ? 'danger' : 'primary',
+      detail: (
+        <ul className="confirmation-list">
+          {reviews.map((review) => (
+            <li key={review.id}>{review.title}</li>
+          ))}
+        </ul>
+      ),
+      action: async () => {
+        const result = await api.bulkReviewDecision({
+          itemIds,
+          decision,
+          confirmation: true,
+          actor: 'desktop-operator',
+          note: `Bulk ${decision} from Inbox.`,
+        })
+        const followUpCount = result.results.filter(
+          (item) => item.success && item.requiresFollowUp,
+        ).length
+        setBulkResult(result)
+        const completedIds = new Set(
+          result.results.filter((item) => item.success).map((item) => item.itemId),
+        )
+        setSnapshot((current) =>
+          current
+            ? {
+                ...current,
+                reviewQueue: current.reviewQueue.filter(
+                  (review) => !completedIds.has(review.id),
+                ),
+              }
+            : current,
+        )
+        setReviewEdit(null)
+        const successMessage = `${result.completed} of ${result.attempted} attempted reviews completed${
+          result.stopped ? '; processing stopped after a failure' : ''
+        }${followUpCount > 0 ? `; ${followUpCount} require follow-up` : ''}.`
+        try {
+          const next = await refreshDashboard()
+          const historyEntry = reviews
+            .filter((review) => completedIds.has(review.id))
+            .map((review) => entryForReview(next, review))
+            .find((entry): entry is ContextEntry => Boolean(entry))
+          setNotice(
+            historyEntry
+              ? {
+                  message: successMessage,
+                  actionLabel: 'Open history',
+                  action: () =>
+                    requestEntryHistory(historyEntry.id, historyEntry.scopeId),
+                }
+              : { message: successMessage },
+          )
+          setLiveMessage(
+            `${result.completed} of ${result.attempted} attempted reviews completed.`,
+          )
+        } catch {
+          showStaleMutationNotice(successMessage)
+        }
+      },
+    }))
+  }
+
+  function navigateToEntry(entryId: string, scopeId: string) {
+    if (!snapshot) return
+    const entry = snapshot.entries.find(
+      (candidate) => candidate.id === entryId && candidate.scopeId === scopeId,
+    )
+    if (!entry) {
+      showError('That local entry is no longer available. Refresh and try again.')
+      return
+    }
+    runProtected(async () => {
+      try {
+        await persistAndCommitEntry(entry, { focus: 'editor' })
+      } catch (error) {
+        handleApiError(error)
+      }
+    })
+  }
+
+  function activateSearchResult(result: SearchResult) {
+    if (!snapshot) return
+    if (result.kind === 'entry') {
+      const entry = snapshot.entries.find(
+        (candidate) =>
+          candidate.id === result.target.entryId &&
+          (!result.target.scopeId || candidate.scopeId === result.target.scopeId),
+      )
+      if (entry) {
+        navigateToEntry(entry.id, entry.scopeId)
+        return
+      }
+    }
+    if (result.kind === 'review') {
+      const review = snapshot.reviewQueue.find(
+        (candidate) => candidate.id === (result.target.reviewId ?? result.id),
+      )
+      if (review) {
+        selectReview(review.id, true)
+        return
+      }
+    }
+    if (result.kind === 'revision') {
+      const revision = snapshot.revisions.find(
+        (candidate) => candidate.id === (result.target.revisionId ?? result.id),
+      )
+      const entry = revision
+        ? snapshot.entries.find((candidate) => candidate.id === revision.entityId)
+        : undefined
+      if (revision && entry) {
+        requestEntryHistory(entry.id, entry.scopeId, revision.id)
+        return
+      }
+      if (revision?.entityId === 'review') {
+        setActiveView('connections')
+        setFocusedConnectionId('review-policy')
+        setFocusedRunId(undefined)
+        return
+      }
+    }
+    if (result.kind === 'run') {
+      const run = snapshot.activity.find((candidate) => candidate.id === result.id)
+      if (run) {
+        runProtected(async () => {
+          try {
+            if (
+              result.target.scopeId &&
+              scopes.some((scope) => scope.id === result.target.scopeId)
+            ) {
+              await persistAndCommitScope(result.target.scopeId)
+            }
+            setActiveView('connections')
+            setFocusedRunId(run.id)
+            setFocusedConnectionId(undefined)
+          } catch (error) {
+            handleApiError(error)
+          }
+        })
+        return
+      }
+    }
+    if (result.kind === 'adapter') {
+      const adapter = snapshot.adapters.find(
+        (candidate) => candidate.id === (result.target.adapterId ?? result.id),
+      )
+      if (adapter) {
+        setActiveView('connections')
+        setFocusedConnectionId(adapter.id)
+        setFocusedRunId(undefined)
+        return
+      }
+    }
+    if (result.kind === 'pack') {
+      const pack = snapshot.packs.find(
+        (candidate) =>
+          candidate.id === (result.target.packId ?? result.id) &&
+          (!result.target.scopeId || candidate.scopeId === result.target.scopeId),
+      )
+      const entryFromPack = pack
+        ? snapshot.entries.find((candidate) => candidate.packId === pack.id)
+        : undefined
+      if (entryFromPack) {
+        navigateToEntry(entryFromPack.id, entryFromPack.scopeId)
+        return
+      }
+      if (pack) {
+        runProtected(async () => {
+          try {
+            await api.setSelectedScope(pack.scopeId)
+            commitEntryContext(pack.scopeId, undefined, {
+              view: 'library',
+              focus: 'editor',
+              pack,
+            })
+          } catch (error) {
+            handleApiError(error)
+          }
+        })
+        return
+      }
+    }
+    showError('That search result no longer maps to an available local record.')
+  }
+
+  function activateQuickTarget(target: QuickOpenTarget) {
+    if (!snapshot) return
+    if (target.type === 'view') {
+      changeView(target.view)
+    } else if (target.type === 'scope') {
+      changeScope(target.scopeId, 'library')
+    } else if (target.type === 'entry') {
+      navigateToEntry(target.entryId, target.scopeId)
+    } else if (target.type === 'review') {
+      selectReview(target.reviewId, true)
+    } else if (target.type === 'revision') {
+      const revision = snapshot.revisions.find(
+        (candidate) => candidate.id === target.revisionId,
+      )
+      const entry = snapshot.entries.find(
+        (candidate) => candidate.id === target.entityId,
+      )
+      if (revision && entry) requestEntryHistory(entry.id, entry.scopeId, revision.id)
+      else if (revision?.entityId === 'review') {
+        runProtected(() => {
+          setActiveView('connections')
+          setFocusedConnectionId('review-policy')
+          setFocusedRunId(undefined)
+        })
+      }
+    } else if (target.type === 'run') {
+      runProtected(() => {
+        setActiveView('connections')
+        setFocusedRunId(target.runId)
+        setFocusedConnectionId(undefined)
+      })
+    } else if (target.type === 'connection') {
+      runProtected(() => {
+        setActiveView('connections')
+        setFocusedConnectionId(target.connectionId)
+        setFocusedRunId(undefined)
+      })
+    } else if (target.type === 'new-entry') {
+      runProtected(async () => {
+        try {
+          await api.setSelectedScope(target.scopeId)
+          commitEntryContext(target.scopeId, undefined, {
+            view: 'library',
+            focus: 'editor',
+          })
+        } catch (error) {
+          handleApiError(error)
+        }
+      })
     }
   }
 
-  if (loadState === 'loading' && !snapshot) {
+  const quickOpenItems = useMemo<QuickOpenItem[]>(() => {
+    if (!snapshot) return []
+    const commands: QuickOpenItem[] = [
+      ...navigation.map((item, index) => ({
+        id: `view-${item.id}`,
+        kind: 'command' as const,
+        title: `Open ${item.label}`,
+        detail: item.description,
+        searchText: `${item.label} ${item.description}`,
+        target: { type: 'view' as const, view: item.id },
+        rank: index,
+      })),
+      {
+        id: 'command-new-entry',
+        kind: 'command',
+        title: 'New entry',
+        detail: `Create an entry in ${currentScope?.label ?? 'the selected scope'}`,
+        searchText: 'new create entry context',
+        target: { type: 'new-entry', scopeId: selectedScopeId },
+        rank: 6,
+      },
+      {
+        id: 'command-privacy',
+        kind: 'command',
+        title: 'Open Privacy & Data',
+        detail: 'Local paths, disclosures, backup preview, and scoped archive',
+        searchText: 'privacy data backup import forget archive paths',
+        target: { type: 'connection', connectionId: 'privacy-data' },
+        rank: 7,
+      },
+    ]
+    return [
+      ...commands,
+      ...snapshot.entries.map((entry, index) => ({
+        id: `entry-${entry.id}`,
+        kind: 'entry' as const,
+        title: entry.title ?? entry.key,
+        detail: `${entry.packName} · ${scopeLayerLabel(entry.scopeKind)}${
+          entry.scopeKind === 'task' ? ' (derived)' : ''
+        } · ${entry.format}`,
+        searchText: `${entry.key} ${entry.kind} ${entry.body} ${entry.tags.join(' ')} ${entry.provenance.source}`,
+        target: { type: 'entry' as const, entryId: entry.id, scopeId: entry.scopeId },
+        rank: 20 + index,
+      })),
+      ...scopes.map((scope, index) => ({
+        id: `scope-${scope.id}`,
+        kind: 'scope' as const,
+        title: scopeLayerLabel(scope.kind),
+        detail: `${scope.kind === 'task' ? 'Derived · ' : ''}${scope.label} · ${
+          scope.description
+        }`,
+        searchText: `${scope.label} ${scope.kind} ${scope.description} ${scope.status}`,
+        target: { type: 'scope' as const, scopeId: scope.id },
+        rank: 50 + index,
+      })),
+      ...snapshot.reviewQueue.map((review, index) => ({
+        id: `review-${review.id}`,
+        kind: 'review' as const,
+        title: review.title,
+        detail: `${review.packName} · ${review.reason ?? 'review'}`,
+        searchText: `${review.summary} ${review.source} ${review.requestedBy} ${review.entryKey}`,
+        target: {
+          type: 'review' as const,
+          reviewId: review.id,
+          scopeId: review.scopeId,
+        },
+        rank: 80 + index,
+      })),
+      ...snapshot.revisions.map((revision, index) => ({
+        id: `revision-${revision.id}`,
+        kind: 'revision' as const,
+        title: revision.entityLabel,
+        detail: `${revision.note} · ${formatTimestamp(revision.createdAt)}`,
+        searchText: `${revision.changeSummary} ${revision.author}`,
+        target: {
+          type: 'revision' as const,
+          revisionId: revision.id,
+          entityId: revision.entityId,
+        },
+        rank: 110 + index,
+      })),
+      ...snapshot.activity.map((run, index) => ({
+        id: `run-${run.id}`,
+        kind: 'run' as const,
+        title: run.summary,
+        detail: `${run.actor} · ${run.status}`,
+        searchText: `${run.actor} ${run.status}`,
+        target: { type: 'run' as const, runId: run.id },
+        rank: 140 + index,
+      })),
+      ...snapshot.adapters.map((adapter, index) => ({
+        id: `adapter-${adapter.id}`,
+        kind: 'connection' as const,
+        title: adapter.name,
+        detail: `${adapter.state} · ${adapter.note}`,
+        searchText: `${adapter.kind} ${adapter.path} ${adapter.detectedVersion ?? ''}`,
+        target: { type: 'connection' as const, connectionId: adapter.id },
+        rank: 170 + index,
+      })),
+    ]
+  }, [currentScope?.label, scopes, selectedScopeId, snapshot])
+
+  if (loadState === 'loading') {
     return (
-      <main className="app-shell app-shell--centered">
-        <div className="loading-state" role="status">
-          <div className="spinner" aria-hidden="true"></div>
-          <h1>Loading the local context control plane</h1>
-          <p>Preparing packs, review queues, adapter health, and revision history.</p>
+      <main className="loading-shell">
+        <div className="loading-emblem" aria-hidden="true">
+          UC
+        </div>
+        <div role="status">
+          <p className="eyebrow">Local editorial control room</p>
+          <h1>Opening Context</h1>
+          <p>Reading the local dashboard and review policy.</p>
         </div>
       </main>
     )
   }
 
-  if (loadState === 'error' || !snapshot || !settingsDraft) {
+  if (loadState === 'error' || !snapshot) {
     return (
-      <main className="app-shell app-shell--centered">
-        <div className="loading-state loading-state--error">
-          <h1>Couldn’t load the desktop control plane</h1>
-          <p>{banner?.message ?? 'The local snapshot is unavailable right now.'}</p>
+      <main className="loading-shell">
+        <div className="load-error" role="alert">
+          <p className="eyebrow">Local backend unavailable</p>
+          <h1>Couldn’t open Context</h1>
+          <p>{errorMessage || 'The local dashboard could not be loaded.'}</p>
           <button type="button" className="primary-button" onClick={() => window.location.reload()}>
             Retry
           </button>
@@ -602,588 +1085,372 @@ function App({ api = desktopApi }: AppProps) {
     )
   }
 
+  if (!snapshot.onboarding.complete) {
+    return (
+      <>
+        <div className="sr-only" aria-live="polite" aria-atomic="true">
+          {liveMessage}
+        </div>
+        {errorMessage ? (
+          <div className="global-alert" role="alert">
+            {errorMessage}
+          </div>
+        ) : null}
+        <Onboarding
+          api={api}
+          snapshot={snapshot}
+          onAnnounce={announce}
+          onError={showError}
+          onComplete={async () => {
+            await refreshDashboard()
+            setActiveView('library')
+          }}
+        />
+      </>
+    )
+  }
+
   return (
     <main className="app-shell">
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {liveMessage}
+      </div>
+
       <aside className="sidebar">
         <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">
-            <span></span>
-          </div>
+          <span className="brand-mark" aria-hidden="true">
+            UC
+          </span>
           <div>
-            <p className="eyebrow">Universal Context Manager</p>
-            <h1>Desktop control plane</h1>
+            <h1>Context</h1>
+            <p>Local control room</p>
           </div>
         </div>
 
-        <div className="sidebar-status">
-          <StatusPill label={snapshot.connected ? 'Local daemon connected' : 'Offline'} tone={snapshot.connected ? 'positive' : 'negative'} />
-          <span>Last sync {formatTimestamp(snapshot.lastSyncAt)}</span>
-        </div>
-
-        <nav className="view-nav" aria-label="Primary views">
-          {views.map((view) => (
+        <nav className="primary-nav" aria-label="Primary navigation">
+          {navigation.map((item) => (
             <button
-              key={view.id}
+              key={item.id}
               type="button"
-              className={`view-button ${activeView === view.id ? 'view-button--selected' : ''}`}
-              onClick={() => setActiveView(view.id)}
+              className={activeView === item.id ? 'is-selected' : ''}
+              aria-current={activeView === item.id ? 'page' : undefined}
+              onClick={() => changeView(item.id)}
+              title={item.description}
             >
-              <strong>{view.label}</strong>
-              <span>{view.description}</span>
+              <span className="nav-glyph" aria-hidden="true">
+                {item.glyph}
+              </span>
+              <span>{item.label}</span>
+              {item.id === 'inbox' && snapshot.reviewQueue.length > 0 ? (
+                <span className="nav-count">{snapshot.reviewQueue.length}</span>
+              ) : null}
             </button>
           ))}
         </nav>
 
-        <div className="scope-list" aria-label="Global, project, and task scopes">
-          <div className="section-heading">
-            <strong>Scopes</strong>
-            <button
-              type="button"
-              className="ghost-button"
-              onClick={() => {
-                setSelectedPackId(NEW_PACK_ID)
-                setEditorDraft(emptyDraft(selectedScopeId))
-              }}
-            >
-              New pack
-            </button>
+        <section className="scope-rail" aria-labelledby="scope-rail-heading">
+          <header>
+            <h2 id="scope-rail-heading">Scope</h2>
+            <span>{scopes.length}</span>
+          </header>
+          <div className="scope-buttons">
+            {scopes.map((scope) => (
+              <button
+                key={scope.id}
+                type="button"
+                className={selectedScopeId === scope.id ? 'is-selected' : ''}
+                aria-pressed={selectedScopeId === scope.id}
+                title={`${scope.id}\n${scope.description}`}
+                onClick={() => changeScope(scope.id)}
+              >
+                <span className="scope-button__line">
+                  <strong>{scopeLayerLabel(scope.kind)}</strong>
+                  {scope.kind === 'task' ? <StatusPill label="derived" /> : null}
+                </span>
+                <small>{scope.label}</small>
+              </button>
+            ))}
           </div>
-          {scopes.map((scope) => (
-            <ScopeButton
-              key={scope.id}
-              node={scope}
-              selected={scope.id === selectedScopeId}
-              onSelect={handleScopeChange}
-            />
-          ))}
-        </div>
-      </aside>
-
-      <section className="workspace">
-        <header className="workspace-header">
-          <div>
-            <p className="eyebrow">Local-first workspace</p>
-            <h2>{currentScope?.label ?? 'Select a scope'}</h2>
-            <p className="workspace-copy">
-              {currentScope?.description ?? 'Choose a global, project, or task scope from the sidebar.'}
-            </p>
-          </div>
-          <div className="workspace-header__meta">
-            <StatusPill label={currentScope?.status ?? 'Unknown'} tone={statusTone(currentScope?.status ?? 'unknown')} />
-            <span>{snapshot.notices.length} notice{snapshot.notices.length === 1 ? '' : 's'}</span>
-          </div>
-        </header>
-
-        {banner ? <div className={`banner banner--${banner.tone}`}>{banner.message}</div> : null}
-
-        <section className="metrics-grid">
-          <SummaryMetric
-            value={snapshot.stats.activePacks.toString()}
-            label="Active packs"
-            detail="Approved and included in composed previews."
-          />
-          <SummaryMetric
-            value={snapshot.stats.pendingReviews.toString()}
-            label="Pending reviews"
-            detail="Human-governed changes waiting for a decision."
-          />
-          <SummaryMetric
-            value={snapshot.stats.healthyAdapters.toString()}
-            label="Healthy adapters"
-            detail="Local bridges reporting current status."
-          />
-          <SummaryMetric
-            value={snapshot.stats.runningAgents.toString()}
-            label="Running agents"
-            detail="Background context runs currently executing."
-          />
         </section>
 
+        <footer className="sidebar-footer">
+          <div>
+            <span className="sidebar-status-pills">
+              <StatusPill label={snapshot.connected ? 'connected' : 'offline'} />
+              <StatusPill label={snapshot.diagnostics.overallState} />
+            </span>
+            <small>Last checked/refreshed {formatTimestamp(snapshot.diagnostics.generatedAt)}</small>
+          </div>
+          <button
+            type="button"
+            className="quick-open-trigger"
+            data-quick-open-trigger
+            aria-keyshortcuts="Meta+K Control+K"
+            onClick={() => setQuickOpen(true)}
+          >
+            <span>Quick Open</span>
+            <kbd>⌘K</kbd>
+          </button>
+        </footer>
+      </aside>
+
+      <section className="workspace" data-dialog-fallback tabIndex={-1}>
+        <header className="workspace-bar">
+          <div>
+            <p className="eyebrow">
+              {scopeLayerLabel(currentScope?.kind ?? 'project')}
+              {currentScope?.kind === 'task' ? ' · derived' : ''}
+            </p>
+            <strong>{currentScope?.label ?? 'Local context'}</strong>
+            <small>{scopeLayerDetail(currentScope?.kind ?? 'project')}</small>
+          </div>
+          <button
+            type="button"
+            className="quick-open-header-button"
+            aria-label="Open Quick Open"
+            onClick={() => setQuickOpen(true)}
+          >
+            <span aria-hidden="true">⌕</span>
+            Quick Open
+            <kbd>⌘K</kbd>
+          </button>
+        </header>
+
         {snapshot.notices.length > 0 ? (
-          <Card title="Operator notices" subtitle="Recent local warnings and guidance.">
-            <ul className="notice-list">
-              {snapshot.notices.map((notice) => (
-                <li key={notice}>{notice}</li>
+          <details className="system-notices">
+            <summary>
+              <span>Local notes</span>
+              <small>{snapshot.notices.length}</small>
+            </summary>
+            <ul>
+              {snapshot.notices.map((item) => (
+                <li key={item}>{item}</li>
               ))}
             </ul>
-          </Card>
+          </details>
         ) : null}
 
-        {activeView === 'overview' ? (
-          <div className="content-grid content-grid--overview">
-            <Card
-              title="Context packs"
-              subtitle="Select a pack to edit, review metadata, and manage status."
-              actions={
-                <button type="button" className="ghost-button" onClick={() => setSelectedPackId(NEW_PACK_ID)}>
-                  New draft
-                </button>
+        {errorMessage ? (
+          <div className="banner banner--error" role="alert">
+            <span aria-hidden="true">!</span>
+            <p>{errorMessage}</p>
+            <button type="button" className="text-button" onClick={() => setErrorMessage('')}>
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+
+        {notice ? (
+          <div className="banner banner--notice" role="status">
+            <span aria-hidden="true">✓</span>
+            <p>{notice.message}</p>
+            {notice.actionLabel && notice.action ? (
+              <button type="button" className="text-button" onClick={notice.action}>
+                {notice.actionLabel}
+              </button>
+            ) : (
+              <button type="button" className="text-button" onClick={() => setNotice(null)}>
+                Dismiss
+              </button>
+            )}
+          </div>
+        ) : null}
+
+        {activeView === 'library' ? (
+          <LibraryView
+            snapshot={snapshot}
+            scopeId={selectedScopeId}
+            selectedEntryId={selectedEntryId}
+            draft={entryDraft}
+            revisions={revisions}
+            busyKey={busyKey}
+            dirty={editorDirty}
+            focusRevisionId={focusRevisionId}
+            onDraftChange={setEntryDraft}
+            onSelectEntry={selectEntry}
+            onNewEntry={startNewEntry}
+            onSave={() => void saveEntry()}
+            onDiscard={() =>
+              setEntryDraft(
+                selectedEntry
+                  ? draftFromEntry(selectedEntry)
+                  : emptyEntryDraft(
+                      selectedScopeId,
+                      selectedPackForNewEntry(snapshot, selectedScopeId),
+                    ),
+              )
+            }
+            onArchive={requestArchive}
+            onRestore={requestRestoreEntry}
+            onRevertPrevious={requestRevertPrevious}
+            onRestoreRevision={requestRestoreRevision}
+          />
+        ) : null}
+
+        {activeView === 'effective' ? (
+          <EffectiveContextView
+            api={api}
+            snapshot={snapshot}
+            initialScopeId={selectedScopeId}
+            onOpenEntry={navigateToEntry}
+            onAnnounce={announce}
+            onError={showError}
+          />
+        ) : null}
+
+        {activeView === 'inbox' ? (
+          <InboxView
+            snapshot={snapshot}
+            selectedReviewId={selectedReviewId}
+            bulkResult={bulkResult}
+            dialogOpen={anyDialogOpen}
+            reviewBusy={reviewDecisionBusy}
+            reviewEdit={reviewEdit}
+            onSelectReview={selectReview}
+            onStartEdit={startReviewEdit}
+            onEditDraftChange={(draft) =>
+              setReviewEdit((current) => (current ? { ...current, draft } : current))
+            }
+            onCancelEdit={() => setReviewEdit(null)}
+            onRequestTransition={runProtected}
+            onDecision={reviewDecision}
+            onBulk={requestBulkDecision}
+            onOpenHistory={(review) => {
+              const entry = entryForReview(snapshot, review)
+              if (entry) requestEntryHistory(entry.id, entry.scopeId)
+              else showError('This proposed entry has no durable history yet.')
+            }}
+          />
+        ) : null}
+
+        {activeView === 'search' ? (
+          <SearchView api={api} onActivate={activateSearchResult} onError={showError} />
+        ) : null}
+
+        {activeView === 'connections' ? (
+          <ConnectionsView
+            api={api}
+            snapshot={snapshot}
+            focusedConnectionId={focusedConnectionId}
+            focusedRunId={focusedRunId}
+            onConfirm={setConfirmation}
+            onAnnounce={announce}
+            onError={showError}
+            onDataChanged={async () => {
+              await refreshDashboard()
+            }}
+            onOpenHistory={() => {
+              const revision = snapshot.revisions[0]
+              const entry = revision
+                ? snapshot.entries.find((candidate) => candidate.id === revision.entityId)
+                : undefined
+              if (revision && entry) {
+                requestEntryHistory(entry.id, entry.scopeId, revision.id)
               }
-            >
-              <div className="split-panel">
-                {currentPacks.length === 0 ? (
-                  <EmptyState
-                    title="No packs in this scope"
-                    body="Use the editor to create the first draft for this scope."
-                  />
-                ) : (
-                  <ul className="list-panel" aria-label="Context packs in this scope">
-                    {currentPacks.map((pack) => (
-                      <li key={pack.id}>
-                        <button
-                          type="button"
-                          className={`list-button ${selectedPackId === pack.id ? 'list-button--selected' : ''}`}
-                          onClick={() => setSelectedPackId(pack.id)}
-                        >
-                          <div className="row-heading">
-                            <strong>{pack.name}</strong>
-                            <StatusPill label={pack.status} tone={statusTone(pack.status)} />
-                          </div>
-                          <p>{pack.summary}</p>
-                          <div className="row-meta">
-                            <span>{pack.tokenEstimate.toLocaleString()} tokens</span>
-                            <span>rev {pack.revision}</span>
-                            <span>{formatTimestamp(pack.updatedAt)}</span>
-                          </div>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                <div className="editor-panel">
-                    <div className="form-grid">
-                      <label>
-                        <span>Pack name</span>
-                        <input
-                          value={editorDraft.name}
-                          onChange={(event) =>
-                            setEditorDraft((draft) => ({ ...draft, name: event.target.value }))
-                          }
-                          placeholder="Reviewer notes"
-                        />
-                      </label>
-                      <label>
-                        <span>Status</span>
-                        <select
-                          value={editorDraft.status}
-                          disabled={editorDraft.status === 'review'}
-                          onChange={(event) =>
-                            setEditorDraft((draft) => ({
-                              ...draft,
-                              status: event.target.value as ContextPack['status'],
-                            }))
-                          }
-                        >
-                          <option value="draft">Draft</option>
-                          <option value="review" disabled>
-                            Pending review
-                          </option>
-                          <option value="active">Active</option>
-                        </select>
-                      </label>
-                      <label className="form-grid__full">
-                        <span>Summary</span>
-                        <input
-                          value={editorDraft.summary}
-                          onChange={(event) =>
-                            setEditorDraft((draft) => ({ ...draft, summary: event.target.value }))
-                          }
-                          placeholder="One sentence operators will scan first."
-                        />
-                      </label>
-                      <label className="form-grid__full">
-                        <span>Tags</span>
-                        <input
-                          value={editorDraft.tags}
-                          onChange={(event) =>
-                            setEditorDraft((draft) => ({ ...draft, tags: event.target.value }))
-                          }
-                          placeholder="review, migration, rollout"
-                        />
-                      </label>
-                      <label className="form-grid__full">
-                        <span>Body</span>
-                        <textarea
-                          value={editorDraft.body}
-                          onChange={(event) =>
-                            setEditorDraft((draft) => ({ ...draft, body: event.target.value }))
-                          }
-                          rows={10}
-                          placeholder="Capture the scoped context operators and agents should receive."
-                        />
-                      </label>
-                    </div>
-
-                    <div className="inline-meta">
-                      <span>Scope: {currentScope?.label ?? 'Unknown'}</span>
-                      <span>{selectedPack?.provenance.length ?? 1} provenance source{selectedPack?.provenance.length === 1 ? '' : 's'}</span>
-                    </div>
-
-                    {selectedPack?.provenance.length ? (
-                      <div className="tag-cluster">
-                        {selectedPack.provenance.map((source) => (
-                          <span key={source} className="tag tag--subtle">
-                            {source}
-                          </span>
-                        ))}
-                      </div>
-                    ) : null}
-
-                    <div className="button-row">
-                      <button
-                        type="button"
-                        className="primary-button"
-                        disabled={busyKey === 'save-pack'}
-                        onClick={handleSavePack}
-                      >
-                        {busyKey === 'save-pack' ? 'Saving…' : 'Save pack'}
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost-button"
-                        onClick={() => setEditorDraft(selectedPack ? draftFromPack(selectedPack) : emptyDraft(selectedScopeId))}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                </div>
-              </div>
-            </Card>
-
-            <Card title="Composed preview" subtitle="The stack sent to local agents after draft filtering.">
-              {!preview || preview.sections.length === 0 ? (
-                <EmptyState
-                  title="Nothing to compose yet"
-                  body="Approve or create packs in the selected scope to build a preview."
-                />
-              ) : (
-                <div className="preview-panel">
-                  <div className="preview-summary">
-                    <div>
-                      <strong>{preview.headline}</strong>
-                      <p>{preview.totalTokens.toLocaleString()} tokens across {preview.sections.length} sections</p>
-                    </div>
-                    {preview.warnings.length > 0 ? (
-                      <div className="warning-box" role="status">
-                        {preview.warnings.map((warning) => (
-                          <p key={warning}>{warning}</p>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                  <ul className="section-stack">
-                    {preview.sections.map((section) => (
-                      <li key={section.id} className="preview-section">
-                        <div className="row-heading">
-                          <strong>{section.packName}</strong>
-                          <span>{section.tokens.toLocaleString()} tokens</span>
-                        </div>
-                        <div className="row-meta">
-                          <span>{section.title}</span>
-                          <span>{section.scopeLabel}</span>
-                        </div>
-                        <p>{section.body}</p>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </Card>
-
-            <Card title="Activity & runs" subtitle="Recent local executions and review operations.">
-              {snapshot.activity.length === 0 ? (
-                <EmptyState
-                  title="No local runs yet"
-                  body="Triggered runs, imports, and reviews will appear here with status and context coverage."
-                />
-              ) : (
-                <ul className="timeline-list">
-                  {snapshot.activity.map((run) => (
-                    <li key={run.id} className="timeline-item">
-                      <div className="row-heading">
-                        <strong>{run.summary}</strong>
-                        <StatusPill label={run.status} tone={statusTone(run.status)} />
-                      </div>
-                      <p>{run.actor}</p>
-                      <div className="row-meta">
-                        <span>{formatTimestamp(run.startedAt)}</span>
-                        <span>{formatDuration(run.durationMs)}</span>
-                        <span>{run.stepCount} steps</span>
-                        <span>{run.contextPackIds.length} packs</span>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </Card>
-          </div>
-        ) : null}
-
-        {activeView === 'review' ? (
-          <div className="content-grid content-grid--review">
-            <Card title="FTS search" subtitle="Ranked local matches across packs, reviews, runs, revisions, and adapters.">
-              <label className="search-box">
-                <span className="sr-only">Search local context</span>
-                <input
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="Search migration, restore, adapter, provenance…"
-                />
-              </label>
-              {searchLoading ? <p className="helper-text">Searching local index…</p> : null}
-              {searchQuery.trim() && searchResults.length === 0 && !searchLoading ? (
-                <EmptyState
-                  title="No local matches"
-                  body="Try a pack title, tag, adapter name, or revision note."
-                />
-              ) : null}
-              {searchResults.length > 0 ? (
-                <ul className="results-list">
-                  {searchResults.map((result) => (
-                    <SearchResultRow key={result.id} result={result} />
-                  ))}
-                </ul>
-              ) : null}
-            </Card>
-
-            <Card title="Review queue" subtitle="Approve, reject, or edit changes before they become active context.">
-              {snapshot.reviewQueue.length === 0 ? (
-                <EmptyState
-                  title="Queue is clear"
-                  body="New review requests will surface here with suggested edits and risk labels."
-                />
-              ) : (
-                <div className="split-panel">
-                  <ul className="list-panel" aria-label="Review queue items">
-                    {snapshot.reviewQueue.map((item) => (
-                      <li key={item.id}>
-                        <button
-                          type="button"
-                          className={`list-button ${selectedReviewId === item.id ? 'list-button--selected' : ''}`}
-                          onClick={() => setSelectedReviewId(item.id)}
-                        >
-                          <div className="row-heading">
-                            <strong>{item.title}</strong>
-                            <StatusPill label={item.risk} tone={statusTone(item.risk)} />
-                          </div>
-                          <p>{item.summary}</p>
-                          <div className="row-meta">
-                            <span>{item.scopeLabel}</span>
-                            <span>{item.requestedBy}</span>
-                            <span>{formatTimestamp(item.requestedAt)}</span>
-                          </div>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-
-                  {selectedReview ? (
-                    <div className="editor-panel">
-                      <div className="detail-card">
-                        <div className="row-heading">
-                          <strong>{selectedReview.packName}</strong>
-                          <StatusPill label={selectedReview.risk} tone={statusTone(selectedReview.risk)} />
-                        </div>
-                        <p>{selectedReview.diff}</p>
-                        <div className="row-meta">
-                          <span>{selectedReview.scopeLabel}</span>
-                          <span>{selectedReview.requestedBy}</span>
-                        </div>
-                      </div>
-                      <label className="form-grid__full">
-                        <span>Editable review draft</span>
-                        <textarea
-                          value={reviewDraft}
-                          onChange={(event) => setReviewDraft(event.target.value)}
-                          rows={10}
-                        />
-                      </label>
-                      <div className="button-row">
-                        <button
-                          type="button"
-                          className="primary-button"
-                          disabled={busyKey === 'review-approve'}
-                          onClick={() => handleReviewAction('approve')}
-                        >
-                          {busyKey === 'review-approve' ? 'Approving…' : 'Approve'}
-                        </button>
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={busyKey === 'review-edit'}
-                          onClick={() => handleReviewAction('edit')}
-                        >
-                          {busyKey === 'review-edit' ? 'Applying…' : 'Apply edited draft'}
-                        </button>
-                        <button
-                          type="button"
-                          className="ghost-button"
-                          disabled={busyKey === 'review-reject'}
-                          onClick={() => handleReviewAction('reject')}
-                        >
-                          {busyKey === 'review-reject' ? 'Rejecting…' : 'Reject'}
-                        </button>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </Card>
-
-            <Card title="Provenance & revision history" subtitle="Inspect recent snapshots and restore a known-good version.">
-              {selectedPack ? (
-                <>
-                  <div className="tag-cluster">
-                    {selectedPack.provenance.map((source) => (
-                      <span key={source} className="tag">
-                        {source}
-                      </span>
-                    ))}
-                  </div>
-                  {revisions.length === 0 ? (
-                    <EmptyState
-                      title="No revisions for this pack"
-                      body="Every save, import, or approved edit will create a restorable snapshot here."
-                    />
-                  ) : (
-                    <ul className="timeline-list">
-                      {revisions.map((revision) => (
-                        <li key={revision.id} className="timeline-item">
-                          <div className="row-heading">
-                            <strong>{revision.note}</strong>
-                            {revision.restorable ? (
-                              <button
-                                type="button"
-                                className="ghost-button"
-                                disabled={busyKey === `restore-${revision.id}`}
-                                onClick={() => handleRestore(revision)}
-                              >
-                                {busyKey === `restore-${revision.id}` ? 'Restoring…' : 'Restore'}
-                              </button>
-                            ) : null}
-                          </div>
-                          <p>{revision.changeSummary}</p>
-                          <div className="row-meta">
-                            <span>{revision.author}</span>
-                            <span>{formatTimestamp(revision.createdAt)}</span>
-                            <span>{revision.id}</span>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </>
-              ) : (
-                <EmptyState
-                  title="Select a pack first"
-                  body="Revision history and provenance badges follow the pack selected in the overview."
-                />
-              )}
-            </Card>
-          </div>
-        ) : null}
-
-        {activeView === 'operations' ? (
-          <div className="content-grid content-grid--operations">
-            <Card title="Harness & daemon health" subtitle="Monitor local harness discovery and the single-writer daemon.">
-              {snapshot.adapters.length === 0 ? (
-                <EmptyState
-                  title="No adapters configured"
-                  body="Install a Codex or Claude Code adapter, then start the local daemon."
-                />
-              ) : (
-                <ul className="timeline-list">
-                  {snapshot.adapters.map((adapter) => (
-                    <AdapterRow
-                      key={adapter.id}
-                      adapter={adapter}
-                      disabled={busyKey === `adapter-${adapter.id}`}
-                      onToggle={handleToggleAdapter}
-                    />
-                  ))}
-                </ul>
-              )}
-            </Card>
-
-            <Card title="Import / export" subtitle="Move local archives in and out without leaving the control plane.">
-              <div className="form-grid">
-                <label className="form-grid__full">
-                  <span>Archive path</span>
-                  <input value={ioPath} onChange={(event) => setIoPath(event.target.value)} />
-                </label>
-              </div>
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={busyKey === 'export'}
-                  onClick={() => handleArchive('export')}
-                >
-                  {busyKey === 'export' ? 'Exporting…' : 'Export snapshot'}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={busyKey === 'import'}
-                  onClick={() => handleArchive('import')}
-                >
-                  {busyKey === 'import' ? 'Importing…' : 'Import snapshot'}
-                </button>
-              </div>
-              <p className="helper-text">
-                Exports include persisted context packs, entries, reviews, and runs from the local daemon-backed store. Desktop preferences stay local.
-              </p>
-            </Card>
-
-            <Card title="Settings" subtitle="Local-only runtime paths and preview guardrails.">
-              <div className="form-grid">
-                <label>
-                  <span>Preview warning threshold</span>
-                  <input
-                    type="number"
-                    min={256}
-                    step={32}
-                    value={settingsDraft.maxPreviewTokens}
-                    onChange={(event) =>
-                      setSettingsDraft((current) =>
-                        current
-                          ? { ...current, maxPreviewTokens: Number(event.target.value) || 0 }
-                          : current,
-                      )
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Socket path</span>
-                  <input
-                    value={settingsDraft.socketPath}
-                    onChange={(event) =>
-                      setSettingsDraft((current) =>
-                        current ? { ...current, socketPath: event.target.value } : current,
-                      )
-                    }
-                  />
-                </label>
-              </div>
-              <p className="helper-text">
-                Governance is fixed to the hybrid policy: safe project/task writes auto-apply;
-                global, conflicting, and locked writes require review. No telemetry or cloud sync is enabled.
-              </p>
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={busyKey === 'save-settings'}
-                  onClick={handleSaveSettings}
-                >
-                  {busyKey === 'save-settings' ? 'Saving…' : 'Save settings'}
-                </button>
-              </div>
-            </Card>
-          </div>
+              else {
+                changeView('library')
+                announce('Opened Library. Select an entry to inspect its history.')
+              }
+            }}
+            onResetOnboarding={() =>
+              setConfirmation({
+                title: 'Run onboarding again?',
+                description:
+                  'This resets only onboarding completion state. Existing local context remains stored.',
+                confirmLabel: 'Reset onboarding',
+                action: async () => {
+                  await api.resetOnboarding()
+                  await refreshDashboard()
+                  announce('Onboarding reset. Existing context was not removed.')
+                },
+              })
+            }
+          />
         ) : null}
       </section>
+
+      {quickOpen ? (
+        <QuickOpen
+          items={quickOpenItems}
+          onClose={() => setQuickOpen(false)}
+          onActivate={(item) => {
+            setQuickOpen(false)
+            activateQuickTarget(item.target)
+          }}
+        />
+      ) : null}
+
+      {confirmation ? (
+        <ConfirmationDialog
+          title={confirmation.title}
+          description={confirmation.description}
+          confirmLabel={confirmation.confirmLabel}
+          tone={confirmation.tone}
+          detail={confirmation.detail}
+          busy={confirmationBusy}
+          onCancel={() => setConfirmation(null)}
+          onConfirm={async () => {
+            try {
+              setConfirmationBusy(true)
+              await confirmation.action()
+              setConfirmation(null)
+            } catch (error) {
+              handleApiError(error)
+            } finally {
+              setConfirmationBusy(false)
+            }
+          }}
+        />
+      ) : null}
+
+      {dirtyDialog ? (
+        <DirtyDecisionDialog
+          itemLabel={
+            activeDirtyKind === 'review'
+              ? selectedReview?.title ?? 'The edited review'
+              : selectedEntry?.title ?? selectedEntry?.key ?? 'The new entry'
+          }
+          busy={dirtyBusy}
+          onStay={() => {
+            pendingProtectedAction.current = null
+            setDirtyDialog(false)
+          }}
+          onDiscard={() => {
+            const action = pendingProtectedAction.current
+            pendingProtectedAction.current = null
+            if (activeDirtyKind === 'review') {
+              setReviewEdit(null)
+            } else {
+              setEntryDraft(
+                selectedEntry
+                  ? draftFromEntry(selectedEntry)
+                  : emptyEntryDraft(
+                      selectedScopeId,
+                      selectedPackForNewEntry(snapshot, selectedScopeId),
+                    ),
+              )
+            }
+            setDirtyDialog(false)
+            if (action) void action()
+          }}
+          onSave={async () => {
+            try {
+              setDirtyBusy(true)
+              const saved =
+                activeDirtyKind === 'review' && selectedReview && reviewEdit
+                  ? await reviewDecision('edit', selectedReview, reviewEdit.draft)
+                  : await saveEntry()
+              if (!saved) return
+              const action = pendingProtectedAction.current
+              pendingProtectedAction.current = null
+              setDirtyDialog(false)
+              if (action) await action()
+            } finally {
+              setDirtyBusy(false)
+            }
+          }}
+        />
+      ) : null}
     </main>
   )
 }

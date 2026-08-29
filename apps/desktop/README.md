@@ -4,6 +4,23 @@ The macOS control plane for the local Universal Context Manager daemon. The prod
 runtime talks to `contextd` through `context-client`; the browser-only development and unit-test
 surface uses synthetic data because a regular browser cannot call Tauri IPC.
 
+Prerequisites: Rust 1.88+, Node 22+, pnpm 9+, and macOS 13+.
+
+## User workflows
+
+- **Onboarding:** select a project, preview existing instructions, create or import the first
+  durable entry, choose review policy, and verify effective context
+- **Inbox:** inspect provenance and before/after content, then approve, edit, reject, or process
+  compatible items in bulk
+- **Library:** edit every individual Markdown or JSON entry without collapsing sibling entries in
+  the same pack
+- **Effective Context:** inspect the backend-rendered Global → Project → Task result, exclusions,
+  provenance, revisions, and adapter destination
+- **Search:** navigate directly to entries, reviews, history, activity, and connections
+- **Connections:** diagnose daemon, binary, MCP, version, permission, spool, and plugin health
+- **Privacy & Data:** inspect local paths and storage boundaries, preview backups/imports, and
+  archive scoped context with confirmation
+
 ## Run the frontend
 
 ```bash
@@ -44,4 +61,5 @@ cargo test -p app
 ```
 
 The desktop exposes live packs, layered previews, FTS search, review decisions, runs, revision
-restore, JSON export, JSON/Markdown import, adapter health, and local settings.
+restore, staged instruction import, validated bundle import, adapter diagnostics, review policy,
+native file dialogs, and local privacy/data controls.

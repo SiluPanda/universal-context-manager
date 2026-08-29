@@ -29,8 +29,20 @@ if [ -n "$contextctl_bin" ] && [ ! -x "$contextctl_bin" ]; then
   echo "[context-manager] CONTEXTCTL_BIN is not executable: $contextctl_bin" >&2
   exit 0
 fi
+if [ -z "$contextctl_bin" ] && [ -n "${CONTEXT_MANAGER_BIN_DIR:-}" ]; then
+  candidate="${CONTEXT_MANAGER_BIN_DIR}/contextctl"
+  if [ -x "$candidate" ]; then
+    contextctl_bin="$candidate"
+  fi
+fi
 if [ -z "$contextctl_bin" ]; then
   contextctl_bin="$(command -v contextctl 2>/dev/null || true)"
+fi
+if [ -z "$contextctl_bin" ] && [ -n "${HOME:-}" ]; then
+  candidate="${HOME}/.local/bin/contextctl"
+  if [ -x "$candidate" ]; then
+    contextctl_bin="$candidate"
+  fi
 fi
 if [ -z "$contextctl_bin" ]; then
   bundled_contextctl="/Applications/Universal Context Manager.app/Contents/MacOS/contextctl"
