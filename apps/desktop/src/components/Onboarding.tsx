@@ -689,15 +689,11 @@ export function Onboarding({
   return (
     <main className="onboarding-shell">
       <aside className="onboarding-rail">
-        <div className="onboarding-brand">
-          <span className="brand-mark" aria-hidden="true">
-            UC
-          </span>
-          <div>
-            <strong>Universal Context Manager</strong>
-            <small>Local editorial control room</small>
-          </div>
-        </div>
+        <div
+          className="sidebar-drag-region"
+          data-tauri-drag-region
+          aria-hidden="true"
+        />
         <ol className="onboarding-steps" aria-label="Onboarding progress">
           {steps.map((label, index) => (
             <li
@@ -719,25 +715,23 @@ export function Onboarding({
           ))}
         </ol>
         <div className="onboarding-local-note">
-          <span aria-hidden="true">⌂</span>
           <p>
-            {snapshot.privacy.localOnlyStatement}{' '}
-            {snapshot.privacy.downstreamAdapterDisclosure}
+            Context and reviews stay on this Mac. Only composed context is shared with configured
+            adapters.
           </p>
         </div>
       </aside>
 
       <section className="onboarding-stage" data-dialog-fallback tabIndex={-1}>
-        <header className="onboarding-stage__header">
-          <p className="eyebrow">
+        <header className="onboarding-stage__header" data-tauri-drag-region>
+          <p className="context-caption" data-tauri-drag-region>
             Step {step + 1} of {steps.length}
           </p>
-          <StatusPill label={snapshot.diagnostics.overallState} />
         </header>
 
         {step === 0 ? (
           <div className="onboarding-panel onboarding-intro">
-            <div className="onboarding-kicker">A local memory desk for agent work</div>
+            <div className="onboarding-kicker">Set up local context</div>
             <h1>Know what is stored.<br />Choose what is composed.</h1>
             <p className="onboarding-lede">
               {snapshot.privacy.localOnlyStatement}{' '}
@@ -910,7 +904,6 @@ export function Onboarding({
                 <section aria-labelledby="detected-source-heading">
                   <header className="subsection-heading">
                     <div>
-                      <p className="eyebrow">Backend detection</p>
                       <h2 id="detected-source-heading">Supported instruction sources</h2>
                     </div>
                     <button
@@ -979,7 +972,6 @@ export function Onboarding({
                 <section className="onboarding-preview" aria-labelledby="source-preview-heading">
                   <header className="subsection-heading">
                     <div>
-                      <p className="eyebrow">Read-only preview</p>
                       <h2 id="source-preview-heading">Import candidates</h2>
                     </div>
                     {importPreview ? <StatusPill label={importPreview.reviewMode} /> : null}
@@ -1066,7 +1058,6 @@ export function Onboarding({
             ) : (
               <section className="finish-card">
                 <div>
-                  <p className="eyebrow">Resumed setup</p>
                   <h2>Use existing durable context</h2>
                   <p>
                     The backend found active entries in this repository. You can keep them,
@@ -1188,7 +1179,6 @@ export function Onboarding({
             {sourceMode === 'manual' ? (
               <section className="finish-card">
                 <div>
-                  <p className="eyebrow">Manual path</p>
                   <h2>{manualDraft.title}</h2>
                   <p>{manualEntry ? 'The first entry is durable.' : 'Create the first durable entry.'}</p>
                 </div>
@@ -1209,7 +1199,6 @@ export function Onboarding({
               <section className="finish-card finish-card--stacked">
                 <header>
                   <div>
-                    <p className="eyebrow">Import path</p>
                     <h2>{importPreview?.packName ?? applyResult?.packName}</h2>
                     <p>{sourceSummary}</p>
                   </div>
@@ -1275,7 +1264,6 @@ export function Onboarding({
             ) : (
               <section className="finish-card">
                 <div>
-                  <p className="eyebrow">Existing durable context</p>
                   <h2>{registration.label}</h2>
                   <p>Ready for a fresh backend composition check.</p>
                 </div>

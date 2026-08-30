@@ -80,9 +80,8 @@ export function SearchView({
   return (
     <div className="view-stack search-view">
       <SectionHeader
-        eyebrow="Local index"
         title="Search"
-        detail="Open an entry, review, revision, run, or connection from typed backend results."
+        detail="Search entries, reviews, revisions, runs, and connections."
       />
 
       <label className="global-search-box">

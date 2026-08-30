@@ -1,64 +1,99 @@
 :root {
   color-scheme: light dark;
-  font-family: "Avenir Next", "SF Pro Text", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 450;
-  line-height: 1.5;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  --paper: #f2eee5;
-  --paper-deep: #e8e1d5;
-  --paper-raised: #faf7f0;
-  --paper-bright: #fffdf8;
-  --graphite: #262724;
-  --graphite-soft: #53544f;
-  --graphite-faint: #74756e;
-  --ink-inverse: #f8f5ed;
-  --cobalt: #2459c4;
-  --cobalt-dark: #1747a9;
-  --cobalt-wash: #e4ebfb;
-  --line: #d8d0c3;
-  --line-strong: #bdb4a6;
-  --positive: #286c4c;
-  --positive-wash: #e4f0e8;
-  --warning: #8a5a12;
-  --warning-wash: #f5ead3;
-  --negative: #a23d36;
-  --negative-wash: #f5e2df;
-  --neutral-wash: #e9e5dc;
-  --shadow-soft: 0 1px 2px rgba(47, 39, 28, 0.08), 0 8px 28px rgba(47, 39, 28, 0.06);
-  --shadow-float: 0 24px 80px rgba(30, 28, 24, 0.24), 0 3px 10px rgba(30, 28, 24, 0.12);
-  --focus: rgba(36, 89, 196, 0.48);
+  --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+
+  --window: #ffffff;
+  --sidebar: #f7f7f8;
+  --surface: #ffffff;
+  --secondary-fill: #f2f2f7;
+  --tertiary-fill: #e9e9ee;
+  --label: #1d1d1f;
+  --secondary-label: rgba(60, 60, 67, 0.82);
+  --tertiary-label: rgba(60, 60, 67, 0.78);
+  --separator: rgba(0, 0, 0, 0.1);
+  --separator-strong: rgba(0, 0, 0, 0.18);
+  --accent: #0072ef;
+  --accent-hover: #005fce;
+  --accent-text: #0061cf;
+  --accent-fill: rgba(0, 122, 255, 0.11);
+  --green: #34c759;
+  --green-label: #196529;
+  --green-fill: rgba(52, 199, 89, 0.12);
+  --orange: #ff9500;
+  --orange-label: #874d00;
+  --orange-fill: rgba(255, 149, 0, 0.13);
+  --red: #ff3b30;
+  --red-solid: #e11500;
+  --red-label: #b8000f;
+  --red-fill: rgba(255, 59, 48, 0.11);
+
+  /* Compatibility aliases used throughout the existing class-based UI. */
+  --paper: var(--window);
+  --paper-deep: var(--secondary-fill);
+  --paper-raised: var(--surface);
+  --paper-bright: var(--surface);
+  --graphite: var(--label);
+  --graphite-soft: var(--secondary-label);
+  --graphite-faint: var(--tertiary-label);
+  --ink-inverse: #ffffff;
+  --cobalt: var(--accent);
+  --cobalt-dark: var(--accent-hover);
+  --cobalt-wash: var(--accent-fill);
+  --line: var(--separator);
+  --line-strong: var(--separator-strong);
+  --positive: var(--green-label);
+  --positive-wash: var(--green-fill);
+  --warning: var(--orange-label);
+  --warning-wash: var(--orange-fill);
+  --negative: var(--red-label);
+  --negative-wash: var(--red-fill);
+  --neutral-wash: var(--secondary-fill);
+  --shadow-soft: none;
+  --shadow-float: 0 20px 60px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.12);
+  --focus: #0072ef;
+  --field-border: #8e8e93;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper: #1f201e;
-    --paper-deep: #191a18;
-    --paper-raised: #292a27;
-    --paper-bright: #30312d;
-    --graphite: #f0ede4;
-    --graphite-soft: #c2beb4;
-    --graphite-faint: #96938b;
-    --ink-inverse: #181917;
-    --cobalt: #6f96eb;
-    --cobalt-dark: #87a8ee;
-    --cobalt-wash: #283755;
-    --line: #3d3d38;
-    --line-strong: #5a5952;
-    --positive: #73bd92;
-    --positive-wash: #21372a;
-    --warning: #d5a557;
-    --warning-wash: #3d321f;
-    --negative: #e27b72;
-    --negative-wash: #402725;
-    --neutral-wash: #373732;
-    --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25), 0 12px 30px rgba(0, 0, 0, 0.16);
-    --shadow-float: 0 26px 90px rgba(0, 0, 0, 0.48), 0 3px 12px rgba(0, 0, 0, 0.3);
-    --focus: rgba(111, 150, 235, 0.58);
+    --window: #1e1e1e;
+    --sidebar: #252525;
+    --surface: #252525;
+    --secondary-fill: #2c2c2e;
+    --tertiary-fill: #3a3a3c;
+    --label: #f5f5f7;
+    --secondary-label: rgba(235, 235, 245, 0.72);
+    --tertiary-label: rgba(235, 235, 245, 0.58);
+    --separator: rgba(255, 255, 255, 0.12);
+    --separator-strong: rgba(255, 255, 255, 0.2);
+    --accent: #0074e8;
+    --accent-hover: #0063c8;
+    --accent-text: #6fb4ff;
+    --accent-fill: rgba(10, 132, 255, 0.2);
+    --green: #30d158;
+    --green-label: #57de78;
+    --green-fill: rgba(48, 209, 88, 0.16);
+    --orange: #ff9f0a;
+    --orange-label: #ffb340;
+    --orange-fill: rgba(255, 159, 10, 0.17);
+    --red: #ff453a;
+    --red-solid: #e11500;
+    --red-label: #ff8b84;
+    --red-fill: rgba(255, 69, 58, 0.17);
+    --ink-inverse: #ffffff;
+    --shadow-float: 0 24px 70px rgba(0, 0, 0, 0.58), 0 2px 10px rgba(0, 0, 0, 0.38);
+    --focus: #4a9eff;
+    --field-border: #7d7d82;
   }
 }
 
@@ -76,11 +111,8 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    radial-gradient(circle at 84% 6%, rgba(255, 255, 255, 0.52), transparent 31rem),
-    linear-gradient(115deg, transparent 0 48%, rgba(82, 65, 39, 0.025) 48% 49%, transparent 49%),
-    var(--paper);
-  color: var(--graphite);
+  background: var(--window);
+  color: var(--label);
 }
 
 button,
@@ -106,10 +138,10 @@ h1,
 h2,
 h3,
 h4 {
-  color: var(--graphite);
+  color: var(--label);
 }
 
 ::selection {
-  background: var(--cobalt);
-  color: #fff;
+  background: var(--accent);
+  color: #ffffff;
 }

@@ -8,22 +8,7 @@ export function StatusPill({
   label: string
   tone?: StatusTone
 }) {
-  const glyph =
-    tone === 'positive'
-      ? '✓'
-      : tone === 'negative'
-        ? '!'
-        : tone === 'warning'
-          ? '•'
-          : tone === 'info'
-            ? 'i'
-            : '–'
-  return (
-    <span className={`status-pill status-pill--${tone}`}>
-      <span aria-hidden="true">{glyph}</span>
-      {label}
-    </span>
-  )
+  return <span className={`status-pill status-pill--${tone}`}>{label}</span>
 }
 
 export function EmptyState({
@@ -37,9 +22,6 @@ export function EmptyState({
 }) {
   return (
     <div className="empty-state">
-      <div className="empty-state__mark" aria-hidden="true">
-        ·
-      </div>
       <h3>{title}</h3>
       <p>{body}</p>
       {children ? <div className="empty-state__actions">{children}</div> : null}
@@ -48,23 +30,19 @@ export function EmptyState({
 }
 
 export function SectionHeader({
-  eyebrow,
   title,
   detail,
   actions,
 }: {
-  eyebrow?: string
   title: string
   detail?: string
   actions?: ReactNode
 }) {
+  if (!detail && !actions) return null
+
   return (
-    <header className="section-header">
-      <div>
-        {eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}
-        <h2>{title}</h2>
-        {detail ? <p className="section-header__detail">{detail}</p> : null}
-      </div>
+    <header className="section-header" aria-label={`${title} controls`}>
+      {detail ? <p className="section-header__detail">{detail}</p> : <span />}
       {actions ? <div className="section-header__actions">{actions}</div> : null}
     </header>
   )
@@ -122,6 +100,7 @@ export function ModalDialog({
         if (event.target === event.currentTarget && onClose) onClose()
       }}
     >
+      <div className="titlebar-drag-strip" data-tauri-drag-region aria-hidden="true" />
       <section
         ref={dialogRef}
         className={`modal-dialog ${className}`}
@@ -160,7 +139,6 @@ export function ModalDialog({
       >
         <header className="modal-dialog__header">
           <div>
-            <p className="eyebrow">Context Manager</p>
             <h2 id={titleId}>{title}</h2>
             {description ? <p id={descriptionId}>{description}</p> : null}
           </div>

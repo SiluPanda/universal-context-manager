@@ -401,9 +401,7 @@ export function ConnectionsView({
   return (
     <div className="view-stack connections-view">
       <SectionHeader
-        eyebrow="Local runtime"
         title="Connections"
-        detail="Inspect backend-reported health, repair supported local services, and review privacy boundaries."
         actions={
           <div className="segmented-control" role="tablist" aria-label="Connections sections">
             <button
@@ -436,7 +434,6 @@ export function ConnectionsView({
           <section className="settings-card settings-card--wide" aria-labelledby="diagnostics-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Backend report</p>
                 <h3 id="diagnostics-heading">Diagnostics</h3>
                 <p>Last checked/refreshed {formatTimestamp(diagnostics.generatedAt)}</p>
               </div>
@@ -550,7 +547,6 @@ export function ConnectionsView({
           <section className="settings-card" aria-labelledby="adapters-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Downstream targets</p>
                 <h3 id="adapters-heading">Adapters</h3>
               </div>
             </header>
@@ -646,7 +642,6 @@ export function ConnectionsView({
           >
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Governance</p>
                 <h3 id="policy-heading">Review policy</h3>
               </div>
               <StatusPill label={snapshot.reviewPolicy?.mode ?? snapshot.settings.reviewMode} />
@@ -691,7 +686,6 @@ export function ConnectionsView({
           <section className="settings-card settings-card--wide" aria-labelledby="runs-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Recorded activity</p>
                 <h3 id="runs-heading">Recent runs</h3>
               </div>
               <span>{snapshot.activity.length}</span>
@@ -725,7 +719,6 @@ export function ConnectionsView({
           <section className="settings-card settings-card--wide" aria-labelledby="privacy-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Backend disclosure</p>
                 <h3 id="privacy-heading" tabIndex={-1}>Privacy boundary</h3>
               </div>
               <button
@@ -786,7 +779,6 @@ export function ConnectionsView({
           <section className="settings-card" aria-labelledby="paths-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">On this Mac</p>
                 <h3 id="paths-heading">Local paths</h3>
               </div>
             </header>
@@ -817,7 +809,6 @@ export function ConnectionsView({
           <section className="settings-card" aria-labelledby="counts-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Stored records</p>
                 <h3 id="counts-heading">Local counts</h3>
                 <p>
                   {privacy.countsAvailable
@@ -856,7 +847,6 @@ export function ConnectionsView({
           <section className="settings-card settings-card--wide" aria-labelledby="backup-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Native file dialogs</p>
                 <h3 id="backup-heading">Backup &amp; import preview</h3>
                 <p>Paths are selected through macOS dialogs, not editable text fields.</p>
               </div>
@@ -961,7 +951,6 @@ export function ConnectionsView({
           <section className="settings-card settings-card--wide" aria-labelledby="scope-data-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">Scoped data control</p>
                 <h3 id="scope-data-heading">Archive or forget a scope</h3>
                 <p>
                   The current backend archives matching packs and reports reversibility. It does
@@ -1029,7 +1018,6 @@ export function ConnectionsView({
           <section className="settings-card settings-card--wide" aria-labelledby="onboarding-reset-heading">
             <header className="settings-card__header">
               <div>
-                <p className="eyebrow">First-run flow</p>
                 <h3 id="onboarding-reset-heading">Onboarding</h3>
                 <p>
                   Resetting shows the wizard again; it does not remove existing local context.

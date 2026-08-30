@@ -171,9 +171,8 @@ export function InboxView({
   return (
     <div className="view-stack inbox-view">
       <SectionHeader
-        eyebrow="Human review gate"
         title="Inbox"
-        detail="Approve or reject queued changes. Editing remains a single-item action."
+        detail="Review queued changes before they become durable."
         actions={
           selectedIds.size > 0 ? (
             <div className="button-row">
@@ -293,7 +292,6 @@ export function InboxView({
         >
           <header>
             <div>
-              <p className="eyebrow">Bulk {bulkResult.decision}</p>
               <h3 id="bulk-result-heading">
                 {bulkResult.completed} of {bulkResult.attempted} attempted items completed
               </h3>
@@ -415,7 +413,7 @@ export function InboxView({
             <>
               <header className="pane-heading pane-heading--detail">
                 <div>
-                  <p className="eyebrow">
+                  <p className="context-caption">
                     {scopeLayerLabel(selectedReview.scopeKind)}
                     {selectedReview.scopeKind === 'task' ? ' · derived' : ''} ·{' '}
                     {selectedReview.scopeLabel}

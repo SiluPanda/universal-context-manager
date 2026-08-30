@@ -118,13 +118,8 @@ export function LibraryView({
   return (
     <div className="view-stack library-view">
       <SectionHeader
-        eyebrow="Durable context"
         title="Library"
-        detail={`${scopeLayerLabel(scope?.kind ?? 'project')}${
-          scope?.kind === 'task' ? ' · derived' : ''
-        } · ${
-          scope?.label ?? 'Selected scope'
-        }. Entries are edited independently; packs only group them.`}
+        detail="Entries are saved independently; packs organize them."
         actions={
           <>
             <label className="compact-check">
@@ -212,7 +207,6 @@ export function LibraryView({
         >
           <header className="pane-heading pane-heading--editor">
             <div>
-              <p className="eyebrow">{selectedEntry ? 'Editing entry' : 'New entry'}</p>
               <h3 id="entry-editor-heading">
                 {selectedEntry ? entryLabel(selectedEntry) : 'Untitled context'}
               </h3>
@@ -428,7 +422,6 @@ export function LibraryView({
         <aside className="entry-inspector" aria-labelledby="entry-inspector-heading">
           <header className="pane-heading">
             <div>
-              <p className="eyebrow">Inspector</p>
               <h3 id="entry-inspector-heading">
                 {selectedEntry ? entryLabel(selectedEntry) : 'Draft'}
               </h3>

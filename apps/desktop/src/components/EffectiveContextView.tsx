@@ -127,9 +127,8 @@ export function EffectiveContextView({
   return (
     <div className="view-stack effective-view">
       <SectionHeader
-        eyebrow="Backend-composed output"
         title="Effective Context"
-        detail="The exact Markdown, ordering, exclusions, and metrics below come from compose_effective_context."
+        detail="Backend-rendered Markdown with its inclusion trace."
         actions={
           <button type="button" className="secondary-button" disabled={loading} onClick={compose}>
             {loading ? 'Composing…' : 'Compose again'}
@@ -200,7 +199,6 @@ export function EffectiveContextView({
         <>
           <section className="composition-ledger" aria-label="Composition summary">
             <div>
-              <p className="eyebrow">Destination</p>
               <strong>{preview.destinationAdapter}</strong>
               <small>Generated {formatTimestamp(preview.generatedAt)}</small>
             </div>
@@ -260,7 +258,6 @@ export function EffectiveContextView({
             <section className="exact-output-panel" aria-labelledby="exact-output-heading">
               <header>
                 <div>
-                  <p className="eyebrow">Byte-for-byte backend Markdown</p>
                   <h3 id="exact-output-heading">Rendered Markdown</h3>
                 </div>
                 <button
@@ -295,7 +292,6 @@ export function EffectiveContextView({
               <section className="trace-sections" aria-labelledby="ordered-sections-heading">
                 <header className="subsection-heading">
                   <div>
-                    <p className="eyebrow">Backend order</p>
                     <h3 id="ordered-sections-heading">Global → Project → Task</h3>
                   </div>
                   <span>{preview.sections.length} sections</span>
@@ -334,7 +330,6 @@ export function EffectiveContextView({
               <section className="trace-entries" aria-labelledby="included-entries-heading">
                 <header className="subsection-heading">
                   <div>
-                    <p className="eyebrow">Ordered provenance</p>
                     <h3 id="included-entries-heading">Included entries</h3>
                   </div>
                   <span>{preview.includedEntries.length}</span>
@@ -366,7 +361,6 @@ export function EffectiveContextView({
               <section className="trace-exclusions" aria-labelledby="excluded-entries-heading">
                 <header className="subsection-heading">
                   <div>
-                    <p className="eyebrow">Backend exclusions</p>
                     <h3 id="excluded-entries-heading">Excluded entries</h3>
                   </div>
                   <span>{preview.exclusions.length}</span>

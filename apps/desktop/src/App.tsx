@@ -4,7 +4,6 @@ import { ConnectionsView } from './components/ConnectionsView'
 import {
   ConfirmationDialog,
   DirtyDecisionDialog,
-  StatusPill,
 } from './components/Common'
 import { EffectiveContextView } from './components/EffectiveContextView'
 import { InboxView } from './components/InboxView'
@@ -27,7 +26,6 @@ import {
 import {
   type ConfirmationRequest,
   formatTimestamp,
-  scopeLayerDetail,
   scopeLayerLabel,
 } from './lib/ui'
 import { flattenWorkspace } from './lib/contextUtils'
@@ -56,15 +54,64 @@ interface ReviewEditDraft {
 const navigation: Array<{
   id: PrimaryView
   label: string
-  glyph: string
+  icon: PrimaryView
   description: string
 }> = [
-  { id: 'inbox', label: 'Inbox', glyph: '◎', description: 'Review queued changes' },
-  { id: 'library', label: 'Library', glyph: '▤', description: 'Edit durable entries' },
-  { id: 'effective', label: 'Effective Context', glyph: '≡', description: 'Inspect exact output' },
-  { id: 'search', label: 'Search', glyph: '⌕', description: 'Find local records' },
-  { id: 'connections', label: 'Connections', glyph: '⌁', description: 'Health, policy, and privacy' },
+  { id: 'inbox', label: 'Inbox', icon: 'inbox', description: 'Review queued changes' },
+  { id: 'library', label: 'Library', icon: 'library', description: 'Edit durable entries' },
+  {
+    id: 'effective',
+    label: 'Effective Context',
+    icon: 'effective',
+    description: 'Inspect exact output',
+  },
+  { id: 'search', label: 'Search', icon: 'search', description: 'Find local records' },
+  {
+    id: 'connections',
+    label: 'Connections',
+    icon: 'connections',
+    description: 'Health, policy, and privacy',
+  },
 ]
+
+function NavigationIcon({ name }: { name: PrimaryView }) {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      {name === 'inbox' ? (
+        <>
+          <path d="M2.5 3.5h11v9h-11z" />
+          <path d="M2.5 9h3l1.1 1.5h2.8L10.5 9h3" />
+        </>
+      ) : null}
+      {name === 'library' ? (
+        <>
+          <path d="M3 3.25h10v9.5H3z" />
+          <path d="M5.25 5.5h5.5M5.25 8h5.5M5.25 10.5h3.5" />
+        </>
+      ) : null}
+      {name === 'effective' ? (
+        <>
+          <path d="M2.5 4h11M2.5 8h8M2.5 12h5" />
+          <path d="m11 10.5 2.5 1.5-2.5 1.5z" />
+        </>
+      ) : null}
+      {name === 'search' ? (
+        <>
+          <circle cx="7" cy="7" r="4.25" />
+          <path d="m10.25 10.25 3 3" />
+        </>
+      ) : null}
+      {name === 'connections' ? (
+        <>
+          <path d="M2.5 4h11M2.5 8h11M2.5 12h11" />
+          <circle cx="5.25" cy="4" r="1.25" />
+          <circle cx="10.75" cy="8" r="1.25" />
+          <circle cx="7" cy="12" r="1.25" />
+        </>
+      ) : null}
+    </svg>
+  )
+}
 
 function firstEntryForScope(snapshot: DashboardSnapshot, scopeId: string) {
   return (
@@ -123,6 +170,7 @@ function App({ api = desktopApi }: AppProps) {
     [snapshot?.workspace],
   )
   const currentScope = scopes.find((scope) => scope.id === selectedScopeId)
+  const currentNavigation = navigation.find((item) => item.id === activeView)
   const selectedEntry = snapshot?.entries.find(
     (entry) => entry.id === selectedEntryId && entry.scopeId === selectedScopeId,
   )
@@ -1058,11 +1106,9 @@ function App({ api = desktopApi }: AppProps) {
   if (loadState === 'loading') {
     return (
       <main className="loading-shell">
-        <div className="loading-emblem" aria-hidden="true">
-          UC
-        </div>
+        <div className="titlebar-drag-strip" data-tauri-drag-region aria-hidden="true" />
+        <span className="spinner loading-spinner" aria-hidden="true" />
         <div role="status">
-          <p className="eyebrow">Local editorial control room</p>
           <h1>Opening Context</h1>
           <p>Reading the local dashboard and review policy.</p>
         </div>
@@ -1073,8 +1119,8 @@ function App({ api = desktopApi }: AppProps) {
   if (loadState === 'error' || !snapshot) {
     return (
       <main className="loading-shell">
+        <div className="titlebar-drag-strip" data-tauri-drag-region aria-hidden="true" />
         <div className="load-error" role="alert">
-          <p className="eyebrow">Local backend unavailable</p>
           <h1>Couldn’t open Context</h1>
           <p>{errorMessage || 'The local dashboard could not be loaded.'}</p>
           <button type="button" className="primary-button" onClick={() => window.location.reload()}>
@@ -1117,16 +1163,11 @@ function App({ api = desktopApi }: AppProps) {
       </div>
 
       <aside className="sidebar">
-        <div className="brand-block">
-          <span className="brand-mark" aria-hidden="true">
-            UC
-          </span>
-          <div>
-            <h1>Context</h1>
-            <p>Local control room</p>
-          </div>
-        </div>
-
+        <div
+          className="sidebar-drag-region"
+          data-tauri-drag-region
+          aria-hidden="true"
+        />
         <nav className="primary-nav" aria-label="Primary navigation">
           {navigation.map((item) => (
             <button
@@ -1137,8 +1178,8 @@ function App({ api = desktopApi }: AppProps) {
               onClick={() => changeView(item.id)}
               title={item.description}
             >
-              <span className="nav-glyph" aria-hidden="true">
-                {item.glyph}
+              <span className="nav-icon">
+                <NavigationIcon name={item.icon} />
               </span>
               <span>{item.label}</span>
               {item.id === 'inbox' && snapshot.reviewQueue.length > 0 ? (
@@ -1164,53 +1205,59 @@ function App({ api = desktopApi }: AppProps) {
                 onClick={() => changeScope(scope.id)}
               >
                 <span className="scope-button__line">
-                  <strong>{scopeLayerLabel(scope.kind)}</strong>
-                  {scope.kind === 'task' ? <StatusPill label="derived" /> : null}
+                  <strong>{scope.label}</strong>
                 </span>
-                <small>{scope.label}</small>
+                <small>
+                  {scopeLayerLabel(scope.kind)}
+                  {scope.kind === 'task' ? ' · Derived' : ''}
+                </small>
               </button>
             ))}
           </div>
         </section>
 
         <footer className="sidebar-footer">
-          <div>
-            <span className="sidebar-status-pills">
-              <StatusPill label={snapshot.connected ? 'connected' : 'offline'} />
-              <StatusPill label={snapshot.diagnostics.overallState} />
-            </span>
-            <small>Last checked/refreshed {formatTimestamp(snapshot.diagnostics.generatedAt)}</small>
-          </div>
-          <button
-            type="button"
-            className="quick-open-trigger"
-            data-quick-open-trigger
-            aria-keyshortcuts="Meta+K Control+K"
-            onClick={() => setQuickOpen(true)}
+          <span
+            className={`sidebar-connection ${
+              !snapshot.connected
+                ? 'is-offline'
+                : snapshot.diagnostics.overallState === 'healthy'
+                  ? 'is-healthy'
+                  : snapshot.diagnostics.overallState === 'degraded' ||
+                      snapshot.diagnostics.overallState === 'starting'
+                    ? 'is-warning'
+                    : 'is-error'
+            }`}
+            title={`Last checked ${formatTimestamp(snapshot.diagnostics.generatedAt)}`}
           >
-            <span>Quick Open</span>
-            <kbd>⌘K</kbd>
-          </button>
+            <span className="sidebar-connection__dot" aria-hidden="true" />
+            <span>
+              {snapshot.connected ? 'Connected' : 'Offline'} · Diagnostics{' '}
+              {snapshot.diagnostics.overallState}
+            </span>
+          </span>
         </footer>
       </aside>
 
       <section className="workspace" data-dialog-fallback tabIndex={-1}>
-        <header className="workspace-bar">
-          <div>
-            <p className="eyebrow">
+        <header className="workspace-bar" data-tauri-drag-region>
+          <div className="workspace-bar__title" data-tauri-drag-region>
+            <h1 data-tauri-drag-region>{currentNavigation?.label ?? 'Context'}</h1>
+            <small data-tauri-drag-region>
+              {currentScope?.label ?? 'Local context'} ·{' '}
               {scopeLayerLabel(currentScope?.kind ?? 'project')}
-              {currentScope?.kind === 'task' ? ' · derived' : ''}
-            </p>
-            <strong>{currentScope?.label ?? 'Local context'}</strong>
-            <small>{scopeLayerDetail(currentScope?.kind ?? 'project')}</small>
+              {currentScope?.kind === 'task' ? ' · Derived' : ''}
+            </small>
           </div>
           <button
             type="button"
             className="quick-open-header-button"
             aria-label="Open Quick Open"
+            aria-keyshortcuts="Meta+K Control+K"
+            data-quick-open-trigger
             onClick={() => setQuickOpen(true)}
           >
-            <span aria-hidden="true">⌕</span>
+            <NavigationIcon name="search" />
             Quick Open
             <kbd>⌘K</kbd>
           </button>

@@ -88,7 +88,7 @@ export interface CreateDesktopApiOptions {
   dialogs?: Partial<MockDialogSelections>
 }
 
-function hasTauriRuntime() {
+export function hasTauriRuntime() {
   return (
     typeof window !== 'undefined' &&
     Object.prototype.hasOwnProperty.call(window, '__TAURI_INTERNALS__')
