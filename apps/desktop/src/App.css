@@ -5420,9 +5420,22 @@ code {
 }
 
 /* The modal backdrop covers the whole viewport, so it also needs a drag strip.
-   Keep the dialog itself above that strip so it stays fully interactive even
-   when the viewport is short enough for the two to overlap. */
+   The backdrop sets backdrop-filter, which makes it the containing block for
+   fixed-position descendants, so a scrolling backdrop would drag the strip off
+   screen with it. Scroll the dialog internally instead: the dialog box then
+   stays anchored below the strip no matter how tall its content is. */
+.dialog-backdrop {
+  overflow: hidden;
+}
+
 .dialog-backdrop > .modal-dialog {
   position: relative;
   z-index: 1;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.is-tauri .dialog-backdrop {
+  padding-top: max(9vh, 60px);
 }
