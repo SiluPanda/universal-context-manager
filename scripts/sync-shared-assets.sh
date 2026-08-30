@@ -1,7 +1,23 @@
 #!/bin/sh
 set -eu
 
-mode="${1:-sync}"
+case "$#" in
+  0)
+    mode="sync"
+    ;;
+  1)
+    if [ "$1" != "--check" ]; then
+      echo "usage: $0 [--check]" >&2
+      exit 2
+    fi
+    mode="check"
+    ;;
+  *)
+    echo "usage: $0 [--check]" >&2
+    exit 2
+    ;;
+esac
+
 root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
@@ -10,9 +26,13 @@ copy_or_check() {
   dest="$2"
   perms="$3"
 
-  if [ "$mode" = "--check" ]; then
+  if [ "$mode" = "check" ]; then
     if ! cmp -s "$src" "$dest"; then
       echo "shared asset drift: $dest" >&2
+      return 1
+    fi
+    if [ "$perms" = "0755" ] && [ ! -x "$dest" ]; then
+      echo "shared asset mode drift: $dest is not executable" >&2
       return 1
     fi
     return 0

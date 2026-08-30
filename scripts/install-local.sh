@@ -163,21 +163,30 @@ if [ "$install_codex" = true ]; then
     echo "Codex was requested but the codex CLI is unavailable" >&2
     exit 1
   fi
-  if codex plugin list --json \
+  if ! codex_plugins_json="$(codex plugin list --json)"; then
+    echo "Codex plugin state could not be inspected" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$codex_plugins_json" \
     | jq -e '.installed[]? | select(.pluginId == "context-manager@universal-context-manager-local")' \
       >/dev/null; then
     codex plugin remove context-manager@universal-context-manager-local
   fi
-  if codex plugin marketplace list --json \
+  if ! codex_marketplaces_json="$(codex plugin marketplace list --json)"; then
+    echo "Codex marketplace state could not be inspected" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$codex_marketplaces_json" \
     | jq -e '.marketplaces[]? | select(.name == "universal-context-manager-local")' \
       >/dev/null; then
     codex plugin marketplace remove universal-context-manager-local
   fi
   codex plugin marketplace add "$root"
   codex plugin add context-manager@universal-context-manager-local
-  if ! codex plugin list --json \
-    | jq -e '.installed[]? | select(.pluginId == "context-manager@universal-context-manager-local" and .enabled == true)' \
-      >/dev/null; then
+  if ! codex_plugins_json="$(codex plugin list --json)" \
+    || ! printf '%s\n' "$codex_plugins_json" \
+      | jq -e '.installed[]? | select(.pluginId == "context-manager@universal-context-manager-local" and .enabled == true)' \
+        >/dev/null; then
     echo "Codex adapter installation could not be verified" >&2
     exit 1
   fi
@@ -189,21 +198,30 @@ if [ "$install_claude" = true ]; then
     echo "Claude Code was requested but the claude CLI is unavailable" >&2
     exit 1
   fi
-  if claude plugin list --json \
+  if ! claude_plugins_json="$(claude plugin list --json)"; then
+    echo "Claude Code plugin state could not be inspected" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$claude_plugins_json" \
     | jq -e '.[]? | select(.id == "context-manager@universal-context-manager-local" and ((.scope // "user") == "user"))' \
       >/dev/null; then
     claude plugin uninstall --scope user context-manager@universal-context-manager-local
   fi
-  if claude plugin marketplace list --json \
+  if ! claude_marketplaces_json="$(claude plugin marketplace list --json)"; then
+    echo "Claude Code marketplace state could not be inspected" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$claude_marketplaces_json" \
     | jq -e '.[]? | select(.name == "universal-context-manager-local" and ((.scope // "user") == "user"))' \
       >/dev/null; then
     claude plugin marketplace remove universal-context-manager-local
   fi
   claude plugin marketplace add --scope user "$root"
   claude plugin install --scope user context-manager@universal-context-manager-local
-  if ! claude plugin list --json \
-    | jq -e '.[]? | select(.id == "context-manager@universal-context-manager-local" and .enabled == true and ((.scope // "user") == "user"))' \
-      >/dev/null; then
+  if ! claude_plugins_json="$(claude plugin list --json)" \
+    || ! printf '%s\n' "$claude_plugins_json" \
+      | jq -e '.[]? | select(.id == "context-manager@universal-context-manager-local" and .enabled == true and ((.scope // "user") == "user"))' \
+        >/dev/null; then
     echo "Claude Code adapter installation could not be verified" >&2
     exit 1
   fi
@@ -217,25 +235,33 @@ setup_preflight() {
 }
 
 verify_setup_adapters() {
-  "$bin_dir/contextctl" --json setup --project "$root" "$@" \
-    | jq -e 'all(.adapters[]; .configured == true)' >/dev/null
+  expected_count="$1"
+  shift
+  if ! setup_json="$("$bin_dir/contextctl" --json setup --project "$root" "$@")"; then
+    return 1
+  fi
+  printf '%s\n' "$setup_json" \
+    | jq -e --argjson expected_count "$expected_count" '
+          (.adapters | length) == $expected_count
+          and all(.adapters[]; .configured == true)
+        ' >/dev/null
 }
 
 if [ "$install_codex" = true ] && [ "$install_claude" = true ]; then
   setup_preflight --adapter codex --adapter claude-code
-  if ! verify_setup_adapters --adapter codex --adapter claude-code; then
+  if ! verify_setup_adapters 2 --adapter codex --adapter claude-code; then
     echo "Installed adapter files did not pass end-to-end setup verification." >&2
     exit 1
   fi
 elif [ "$install_codex" = true ]; then
   setup_preflight --adapter codex
-  if ! verify_setup_adapters --adapter codex; then
+  if ! verify_setup_adapters 1 --adapter codex; then
     echo "Installed Codex adapter files did not pass setup verification." >&2
     exit 1
   fi
 elif [ "$install_claude" = true ]; then
   setup_preflight --adapter claude-code
-  if ! verify_setup_adapters --adapter claude-code; then
+  if ! verify_setup_adapters 1 --adapter claude-code; then
     echo "Installed Claude Code adapter files did not pass setup verification." >&2
     exit 1
   fi

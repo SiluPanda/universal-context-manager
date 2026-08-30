@@ -26,10 +26,16 @@ if [ -z "$target_triple" ]; then
 fi
 
 cd "$root"
+target_dir="${CARGO_TARGET_DIR:-$root/target}"
+case "$target_dir" in
+  /*) ;;
+  *) target_dir="$root/$target_dir" ;;
+esac
 # shellcheck disable=SC2086
-cargo build $cargo_profile_args -p contextd -p contextctl -p context-mcp
+cargo build $cargo_profile_args --target-dir "$target_dir" \
+  -p contextd -p contextctl -p context-mcp
 
-source_dir="$root/target/$profile_dir"
+source_dir="$target_dir/$profile_dir"
 destination_dir="$root/apps/desktop/src-tauri/binaries"
 mkdir -p "$destination_dir"
 

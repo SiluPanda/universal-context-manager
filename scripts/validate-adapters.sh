@@ -8,11 +8,18 @@ strict_external="${STRICT_EXTERNAL_VALIDATORS:-0}"
 
 cd "$root"
 
-sh -n \
+for script in \
   scripts/install-local.sh \
   scripts/test-install-local.sh \
+  scripts/test-hooks.sh \
+  scripts/e2e-smoke.sh \
+  scripts/validate-adapters.sh \
+  scripts/sync-shared-assets.sh \
+  scripts/prepare-sidecars.sh \
   adapters/shared/scripts/run-context-hook.sh \
-  adapters/shared/scripts/run-context-mcp.sh
+  adapters/shared/scripts/run-context-mcp.sh; do
+  sh -n "$script"
+done
 ./scripts/install-local.sh --help >/dev/null
 ./scripts/sync-shared-assets.sh --check
 ./scripts/test-hooks.sh

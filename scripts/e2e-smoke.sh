@@ -13,12 +13,14 @@ done
 
 cargo build --quiet --bins
 
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/ucm-e2e.XXXXXX")"
 home="$workdir/home"
 project="$workdir/demo-project"
+socket="$workdir/d.sock"
 mkdir -p "$home" "$project"
 git -C "$project" init --quiet
 daemon_pid=""
+export CONTEXT_SOCKET_PATH="$socket"
 
 cleanup() {
   if [ -n "$daemon_pid" ]; then
@@ -33,7 +35,7 @@ CONTEXT_MANAGER_HOME="$home" "$root/target/debug/contextd" --quiet &
 daemon_pid=$!
 
 attempt=0
-while [ ! -S "$home/contextd.sock" ]; do
+while [ ! -S "$socket" ]; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 100 ]; then
     echo "contextd did not create its socket" >&2
