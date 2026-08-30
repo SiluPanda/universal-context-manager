@@ -115,9 +115,23 @@ fn default_socket_path(data_dir: &Path, short_root: &Path) -> PathBuf {
     let hash = format!("{:x}", hasher.finalize());
     let fallback = short_root.join(format!("ucm-{}.sock", &hash[..16]));
     if unix_socket_path_fits(&fallback) {
-        fallback
-    } else {
-        env::temp_dir().join(format!("ucm-{}.sock", &hash[..12]))
+        return fallback;
+    }
+
+    let temp = env::temp_dir().join(format!("ucm-{}.sock", &hash[..12]));
+    if unix_socket_path_fits(&temp) {
+        return temp;
+    }
+
+    // The data dir, the cache dir and TMPDIR are all user controlled and can
+    // each exceed SUN_LEN. Fall back to a location short enough to always bind.
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp").join(format!("ucm-{}.sock", &hash[..12]))
+    }
+    #[cfg(not(unix))]
+    {
+        temp
     }
 }
 
@@ -163,62 +177,107 @@ fn ensure_dir(path: &Path) -> ContextResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-    use tempfile::tempdir;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use tempfile::{TempDir, tempdir};
+
+    const ENV_KEYS: &[&str] = &[
+        "HOME",
+        "CONTEXT_MANAGER_HOME",
+        "CONTEXT_DATA_DIR",
+        "CONTEXT_DB_PATH",
+        "CONTEXT_SOCKET_PATH",
+        "CONTEXT_SPOOL_DIR",
+        "GIT_CEILING_DIRECTORIES",
+    ];
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    #[test]
-    fn ignores_empty_env_paths() {
-        let _guard = env_lock().lock().expect("env lock");
-        let old_manager_home = env::var_os("CONTEXT_MANAGER_HOME");
-        let old_data_dir = env::var_os("CONTEXT_DATA_DIR");
-        let old_socket_path = env::var_os("CONTEXT_SOCKET_PATH");
-        unsafe {
-            env::set_var("CONTEXT_MANAGER_HOME", "   ");
-            env::set_var("CONTEXT_DATA_DIR", "");
-            env::set_var("CONTEXT_SOCKET_PATH", " ");
+    /// A failing assertion inside a test that holds this lock would otherwise
+    /// poison it and turn every later env test into a spurious `PoisonError`
+    /// failure, hiding the one real failure.
+    fn lock_env() -> MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores process environment on drop so a panicking assertion cannot
+    /// leak overrides into unrelated tests.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                saved: ENV_KEYS
+                    .iter()
+                    .map(|key| (*key, env::var_os(key)))
+                    .collect(),
+            }
         }
-        assert!(env_path("CONTEXT_MANAGER_HOME").expect("path").is_none());
-        assert!(env_path("CONTEXT_DATA_DIR").expect("path").is_none());
-        assert!(env_path("CONTEXT_SOCKET_PATH").expect("path").is_none());
-        unsafe {
-            match old_manager_home {
-                Some(value) => env::set_var("CONTEXT_MANAGER_HOME", value),
-                None => env::remove_var("CONTEXT_MANAGER_HOME"),
-            }
-            match old_data_dir {
-                Some(value) => env::set_var("CONTEXT_DATA_DIR", value),
-                None => env::remove_var("CONTEXT_DATA_DIR"),
-            }
-            match old_socket_path {
-                Some(value) => env::set_var("CONTEXT_SOCKET_PATH", value),
-                None => env::remove_var("CONTEXT_SOCKET_PATH"),
+
+        fn set(&self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+            unsafe { env::set_var(key, value) }
+        }
+
+        fn remove(&self, key: &str) {
+            unsafe { env::remove_var(key) }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
             }
         }
     }
 
+    /// Socket paths must fit inside `SUN_LEN`, so tests that assert socket
+    /// layout cannot inherit an arbitrarily long `TMPDIR`.
+    fn short_tempdir() -> TempDir {
+        #[cfg(unix)]
+        {
+            TempDir::new_in("/tmp").expect("tempdir")
+        }
+        #[cfg(not(unix))]
+        {
+            tempdir().expect("tempdir")
+        }
+    }
+
+    #[test]
+    fn ignores_empty_env_paths() {
+        let _guard = lock_env();
+        let env = EnvGuard::new();
+        env.set("CONTEXT_MANAGER_HOME", "   ");
+        env.set("CONTEXT_DATA_DIR", "");
+        env.set("CONTEXT_SOCKET_PATH", " ");
+        assert!(env_path("CONTEXT_MANAGER_HOME").expect("path").is_none());
+        assert!(env_path("CONTEXT_DATA_DIR").expect("path").is_none());
+        assert!(env_path("CONTEXT_SOCKET_PATH").expect("path").is_none());
+    }
+
     #[test]
     fn relative_env_paths_are_absolutized() {
-        let _guard = env_lock().lock().expect("env lock");
-        let old_manager_home = env::var_os("CONTEXT_MANAGER_HOME");
-        let cwd = env::current_dir().expect("cwd");
-        unsafe {
-            env::set_var("CONTEXT_MANAGER_HOME", "relative-ucm-home");
-        }
+        let _guard = lock_env();
+        let env = EnvGuard::new();
+        let cwd = std::env::current_dir().expect("cwd");
+        env.set("CONTEXT_MANAGER_HOME", "relative-ucm-home");
         let path = env_path("CONTEXT_MANAGER_HOME")
             .expect("path")
             .expect("some path");
         assert_eq!(path, cwd.join("relative-ucm-home"));
-        unsafe {
-            match old_manager_home {
-                Some(value) => env::set_var("CONTEXT_MANAGER_HOME", value),
-                None => env::remove_var("CONTEXT_MANAGER_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -310,9 +369,16 @@ mod tests {
 
     #[test]
     fn existing_project_directory_falls_back_to_canonical_path() {
+        let _guard = lock_env();
+        let env = EnvGuard::new();
         let dir = tempdir().expect("tempdir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("project");
+
+        // Without a ceiling, a TMPDIR that happens to live inside a Git
+        // repository would make this resolve to that outer repository root.
+        let ceiling = dir.path().canonicalize().expect("canonical tempdir");
+        env.set("GIT_CEILING_DIRECTORIES", &ceiling);
 
         assert_eq!(
             PathBuf::from(
@@ -358,7 +424,7 @@ mod tests {
 
     #[test]
     fn default_socket_path_is_short_and_deterministic() {
-        let dir = tempdir().expect("tempdir");
+        let dir = short_tempdir();
         let data_dir = dir
             .path()
             .join("very")
@@ -393,74 +459,46 @@ mod tests {
 
     #[test]
     fn discover_preserves_manager_home_socket_when_short() {
-        let _guard = env_lock().lock().expect("env lock");
-        let dir = tempdir().expect("tempdir");
+        let _guard = lock_env();
+        let env = EnvGuard::new();
+        // The socket is only kept beside the data dir when it fits in SUN_LEN,
+        // so this must not inherit a long TMPDIR.
+        let dir = short_tempdir();
         let home = dir.path().join("ucm-home");
-        let old_manager_home = env::var_os("CONTEXT_MANAGER_HOME");
-        let old_data_dir = env::var_os("CONTEXT_DATA_DIR");
-        let old_db_path = env::var_os("CONTEXT_DB_PATH");
-        let old_socket_path = env::var_os("CONTEXT_SOCKET_PATH");
-        let old_spool_dir = env::var_os("CONTEXT_SPOOL_DIR");
-        unsafe {
-            env::set_var("CONTEXT_MANAGER_HOME", &home);
-            env::remove_var("CONTEXT_DATA_DIR");
-            env::remove_var("CONTEXT_DB_PATH");
-            env::remove_var("CONTEXT_SOCKET_PATH");
-            env::remove_var("CONTEXT_SPOOL_DIR");
-        }
+        env.set("CONTEXT_MANAGER_HOME", &home);
+        env.remove("CONTEXT_DATA_DIR");
+        env.remove("CONTEXT_DB_PATH");
+        env.remove("CONTEXT_SOCKET_PATH");
+        env.remove("CONTEXT_SPOOL_DIR");
+
+        let expected_socket = home.join("contextd.sock");
+        assert!(
+            expected_socket.as_os_str().len() < UNIX_SOCKET_PATH_LIMIT,
+            "test precondition: socket path must be short"
+        );
 
         let paths = ContextPaths::discover().expect("discover");
         assert_eq!(paths.data_dir, home);
-        assert_eq!(paths.socket_path, home.join("contextd.sock"));
-
-        unsafe {
-            match old_manager_home {
-                Some(value) => env::set_var("CONTEXT_MANAGER_HOME", value),
-                None => env::remove_var("CONTEXT_MANAGER_HOME"),
-            }
-            match old_data_dir {
-                Some(value) => env::set_var("CONTEXT_DATA_DIR", value),
-                None => env::remove_var("CONTEXT_DATA_DIR"),
-            }
-            match old_db_path {
-                Some(value) => env::set_var("CONTEXT_DB_PATH", value),
-                None => env::remove_var("CONTEXT_DB_PATH"),
-            }
-            match old_socket_path {
-                Some(value) => env::set_var("CONTEXT_SOCKET_PATH", value),
-                None => env::remove_var("CONTEXT_SOCKET_PATH"),
-            }
-            match old_spool_dir {
-                Some(value) => env::set_var("CONTEXT_SPOOL_DIR", value),
-                None => env::remove_var("CONTEXT_SPOOL_DIR"),
-            }
-        }
+        assert_eq!(paths.socket_path, expected_socket);
     }
 
     #[test]
     fn discover_uses_short_socket_path_when_default_data_dir_is_long() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
+        let env = EnvGuard::new();
         let dir = tempdir().expect("tempdir");
         let fake_home = dir
             .path()
             .join("home")
             .join("with-a-pretty-long-user-name-for-macos-tests");
         fs::create_dir_all(&fake_home).expect("mkdir");
-        let old_home = env::var_os("HOME");
-        let old_manager_home = env::var_os("CONTEXT_MANAGER_HOME");
-        let old_data_dir = env::var_os("CONTEXT_DATA_DIR");
-        let old_db_path = env::var_os("CONTEXT_DB_PATH");
-        let old_socket_path = env::var_os("CONTEXT_SOCKET_PATH");
-        let old_spool_dir = env::var_os("CONTEXT_SPOOL_DIR");
 
-        unsafe {
-            env::set_var("HOME", &fake_home);
-            env::remove_var("CONTEXT_MANAGER_HOME");
-            env::remove_var("CONTEXT_DATA_DIR");
-            env::remove_var("CONTEXT_DB_PATH");
-            env::remove_var("CONTEXT_SOCKET_PATH");
-            env::remove_var("CONTEXT_SPOOL_DIR");
-        }
+        env.set("HOME", &fake_home);
+        env.remove("CONTEXT_MANAGER_HOME");
+        env.remove("CONTEXT_DATA_DIR");
+        env.remove("CONTEXT_DB_PATH");
+        env.remove("CONTEXT_SOCKET_PATH");
+        env.remove("CONTEXT_SPOOL_DIR");
 
         let paths = ContextPaths::discover().expect("discover");
         #[cfg(unix)]
@@ -484,33 +522,6 @@ mod tests {
             let listener = UnixListener::bind(&paths.socket_path).expect("bind socket");
             drop(listener);
             fs::remove_file(&paths.socket_path).expect("remove socket");
-        }
-
-        unsafe {
-            match old_home {
-                Some(value) => env::set_var("HOME", value),
-                None => env::remove_var("HOME"),
-            }
-            match old_manager_home {
-                Some(value) => env::set_var("CONTEXT_MANAGER_HOME", value),
-                None => env::remove_var("CONTEXT_MANAGER_HOME"),
-            }
-            match old_data_dir {
-                Some(value) => env::set_var("CONTEXT_DATA_DIR", value),
-                None => env::remove_var("CONTEXT_DATA_DIR"),
-            }
-            match old_db_path {
-                Some(value) => env::set_var("CONTEXT_DB_PATH", value),
-                None => env::remove_var("CONTEXT_DB_PATH"),
-            }
-            match old_socket_path {
-                Some(value) => env::set_var("CONTEXT_SOCKET_PATH", value),
-                None => env::remove_var("CONTEXT_SOCKET_PATH"),
-            }
-            match old_spool_dir {
-                Some(value) => env::set_var("CONTEXT_SPOOL_DIR", value),
-                None => env::remove_var("CONTEXT_SPOOL_DIR"),
-            }
         }
     }
 }
